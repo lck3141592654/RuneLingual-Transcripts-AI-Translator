@@ -237,3 +237,9 @@ Translation costs align closely with estimates. Based on $0.14 USD for 5,000 lin
 
 **Q: `progress.json` was not automatically deleted**
 <br>A: The script deletes it on normal completion. If the script was interrupted, `progress.json` is preserved for checkpoint resumption. Manually deleting it won't affect functionality.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2026 lck3141592654

@@ -237,3 +237,9 @@ IGNORE_LIST: set[str] = {
 
 **Q：`progress.json` 沒有被自動刪除**
 <br>A：腳本正常完成時會自動刪除。若腳本被強制中斷，`progress.json` 會保留下來，方便下次續傳。手動刪除不會影響功能。
+
+## 授權條款 (License)
+
+本項目採用 GPL v3 授權條款。詳細內容請參閱 [LICENSE](LICENSE) 檔案。
+
+Copyright (c) 2026 lck3141592654
