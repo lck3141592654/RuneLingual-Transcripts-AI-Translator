@@ -75,7 +75,7 @@ BASE_URL=https://openrouter.ai/api/v1
 
 ---
 
-## 使用方法 (先將此Github項目放到Runelingual-Transcripts\updater內)
+## 使用方法 (先將experimental文件夾放入Runelingual-Transcripts\updater內)
 
 ### 執行主控腳本
 

@@ -75,7 +75,7 @@ BASE_URL=https://openrouter.ai/api/v1
 
 ---
 
-## Usage (Put the Github project to Runelingual-Transcripts\updater before)
+## Usage (Put experimental folder to Runelingual-Transcripts\updater first)
 
 ### Run the Main Script
 
