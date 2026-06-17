@@ -1,4 +1,4 @@
-# RuneLingual Transcripts AI Translation Pipeline
+# Runelingual Transcripts Hybrid Translation Pipeline
 
 <div align="center">
 
@@ -8,38 +8,52 @@
 
 ## Overview
 
-An AI-powered automated translation pipeline designed for large-scale game text translation, located in the `updater/experimental/` directory.
+An AI-powered automated pipeline designed for large-scale game text translation. Scripts can be placed anywhere — no specific project structure required.
 
-> ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Traditional Chinese and other languages will be supported in the official release.
+> ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
+
+## Latest Update on 18/6/2026, see [Changelog](Changelog.md) for details
+- Added multi-API parallel support with round-robin task distribution and automatic 429 rate-limit handling
+- Added checkpoint resume — re-run the script to continue from where it left off after interruption
+- Added auto-extract glossary from the target Excel's name and manual sheets, no separate file required
+- Unified workplace/ directory for all inputs and outputs, simplifying the workflow
+- Extended retranslation to three-layer checks: terminology, placeholder corruption, and untranslated entries
+- Fixed false positives in review report: when overlapping terms exist (e.g. “Lord Hosidius” vs “Hosidius”), correct longer-term translation no longer triggers a false alarm on the shorter term
+- Enhanced interactive UI: per-batch API indicators, detailed retranslation stats, and comprehensive stage timestamps
+- Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
 
 ### Features
 
-- **Ultra-low cost**: With DeepSeek V4 Flash, translating 75,000 dialogue lines costs approximately **$2.1 USD**
-- **Forced terminology accuracy**: With script assistance, AI achieves **99%+ accuracy** on proper nouns such as character names, locations, and item names. In contrast, tools like Gemini's Gem feature or Qwen's project feature still have a non-negligible rate of mistranslating proper nouns, even with well-crafted prompts.
-- **Interactive operation**: Supports selecting language, sheet, and entry range
-- **Asynchronous concurrency**: Sends multiple API requests simultaneously, significantly reducing translation time
-- **Auto-review**: Automatically checks terminology usage and generates a review report
+- **Ultra-low cost**: With DeepSeek V4 Flash, translating ~75,000 dialogue entries costs approximately **$2.39 USD**
+- **Enforced terminology accuracy**: With script assistance, AI achieves **99%+ accuracy** on proper nouns such as character names, locations, and item names. In contrast, tools like Gemini's Gem feature or Qwen's project feature still have a non-negligible rate of mistranslating proper nouns, even with well-crafted prompts.
+- **Interactive operation**: Supports selecting sheets and entry ranges
+- **Async concurrency**: Sends multiple API requests simultaneously, significantly reducing translation time
+- **Checkpoint resume**: If the translation is interrupted due to network issues or manual interruption (Ctrl+C), simply re-run the script to resume from where it left off — no need to start over
+- **Auto-review**: Three-layer checks (terminology / placeholders / untranslated), generates a color-coded review report
+- **Multi-API support**: Supports using multiple API keys simultaneously (main/fallback classification), round-robin task distribution, automatic 429 rate-limit handling (cooldown/permanent disable), maximizing translation throughput
 
 ### File Structure
 
 | File | Purpose |
-|------|---------|
+|---|---------------------------------|
 | `batch_translate.py` | **Main controller** — interactive entry point |
-| `glossary.py` | Reads terminology Excel and outputs a dictionary |
+| `glossary.py` | Reads terminology Excel or auto-extracts glossary from target + outputs review file |
 | `tm_matcher.py` | Template matching (**not yet enabled**, will be added in the official release) |
-| `llm_translator.py` | **AI batch translation core** — async parallel calls |
-| `enforcer.py` | **Terminology enforcement** — auto-correction + review report generation |
-| `.env` | Your API configuration (copy `.env.example` and remove ".example") |
+| `llm_translator.py` | **AI batch translation core**, async parallel calls |
+| enforcer.py | **Three-layer enforcement** (terminology/placeholders/untranslated), auto-correction + color-coded review report |
+| `api_config.py` | Multi-API configuration parser, supports main/fallback classification, category-level default concurrency, per-API overrides |
+| `.env` | API configuration file, supports multi-API numbered format and legacy single-API format |
 | `.env.example` | Configuration template |
+| `workplace/` | **Working directory** (auto-created), all inputs and outputs stored here |
 
 ### Four-Stage Pipeline
 
 ```
 batch_translate.py → executes in order:
 ① glossary.py      Load terminology database
-② tm_matcher.py    Template pattern matching ⚠️ Not yet enabled, coming in official release
+② tm_matcher.py    Template parameter matching ⚠️ Not yet enabled, will be added in official release
 ③ llm_translator.py AI batch translation (async parallel)
-④ enforcer.py      Terminology enforcement + review report
+④ enforcer.py      Three-layer enforcement (terminology/placeholders/untranslated) + color-coded review report
 ```
 
 ---
@@ -56,73 +70,123 @@ pip install openpyxl pandas openai python-dotenv
 
 This tool supports any **OpenAI-compatible API**. Recommended options:
 
-| Provider | Recommended Model | Cost |
-|----------|-------------------|------|
+| Platform | Recommended Model | Cost |
+|-----------------------------------------------|---------------------------------|----|
 | [OpenRouter](https://openrouter.ai/) | `deepseek/deepseek-v4-flash` | Very low |
-| DeepSeek Official | `deepseek-chat` | Very low |
-| OpenAI | `gpt-4o-mini` | Higher |
+| [DeepSeek Official](https://platform.deepseek.com/) | `deepseek-v4-flash` | Very low |
+| [Nvidia (Free API)](https://build.nvidia.com/) | `deepseek-ai/deepseek-v4-flash` | Free |
 
-### 2. Create a `.env` File
+### 2. Create the `.env` File
 
-Copy `.env.example` to `.env` and fill in your settings:
+Copy `.env.example` to `.env` and fill in your settings. Two formats are supported; examples below:
 
+#### Multi-API Format (Recommended)
+
+```env
+# Main API (paid, default concurrency=10)
+API1_TYPE=main
+API1_PARALLEL_LIMIT=x (Add this parameter with a number if you want to set a custom concurrency limit)
+API1_MODEL_PROVIDER=openrouter
+API1_MODEL=deepseek/deepseek-v4-flash
+API1_API_KEY=sk-your_api_key_here
+API1_BASE_URL=https://openrouter.ai/api/v1
+
+# Fallback API (free, default concurrency=1)
+API2_TYPE=fallback
+API2_PARALLEL_LIMIT=x (Add this parameter with a number if you want to set a custom concurrency limit)
+API2_MODEL_PROVIDER=nvidia
+API2_MODEL=deepseek-ai/deepseek-v4-flash
+API2_API_KEY=nvapi-your_free_key_here
+API2_BASE_URL=https://integrate.api.nvidia.com/v1
+```
+
+Legacy single-API format (backward compatible)
 ```env
 API_KEY=sk-your_api_key_here
 MODEL_PROVIDER=openrouter
 MODEL=deepseek/deepseek-v4-flash
 BASE_URL=https://openrouter.ai/api/v1
 ```
+> Both formats can coexist — if `API1_` settings are detected, the multi-API format takes priority. Each API can optionally set `APIx_PARALLEL_LIMIT` to override the category default. Main API default concurrency=10, fallback API default concurrency=1.
 
 ---
 
-## Usage (Put experimental folder to Runelingual-Transcripts\updater first)
+## Usage
 
-### Run the Main Script
+Place the translation target Excel and glossary (optional) into the `workplace/` directory, then run the main controller script.
+
+### Running the Main Controller
 
 ```bash
-cd updater/experimental
+cd <script directory>
 python batch_translate.py
 ```
+Or run `batch_translate.py` directly.
 
 ### Interactive Steps
 
 ```
-Step 1: Choose language       → Select from directory names under draft/ (e.g., zh, fr)
-Step 2: Choose target Excel   → Select the file to translate
-Step 3: Choose glossary       → Select an Excel glossary or use built-in dictionary only
-Step 4: Choose sheet          → Single or multi-select
-Step 5: Choose translation range → All untranslated / First N test entries / Specific row range
-Step 6: Confirm execution     → Review summary and press Y to confirm
+Step 1: Select target Excel  → Lists all .xlsx files under workplace/
+Step 2: Select glossary      → Choose a glossary Excel, auto-extract from target's name/manual sheets, or skip (built-in ADD_LIST only)
+Step 3: Select worksheets    → Single or multiple
+Step 4: Select range         → All untranslated / First N for testing / Specify row range
+Step 5: Confirm execution    → Shows summary, press Y to confirm
 ```
 
-### Output Files
+### Output After Execution
+
+All output files are placed under the `workplace/` directory:
 
 | File | Description |
-|------|-------------|
-| `{source_filename}_translated_output.xlsx` | **Completed translation file** |
-| `review_report.xlsx` | **Review report** (entries requiring manual review) |
-| `progress.json` | Progress checkpoint (automatically deleted after translation completes) |
+|------|------|
+| `{source_name}_translated_output.xlsx` | **Completed translation file**, located in `workplace/` |
+| `review_report.xlsx` | **Review report** (entries needing manual review), located in `workplace/` |
+| `_checkpoint/` | **Checkpoint resume temp directory**, located in `workplace/` (auto-deleted after completion) |
 
 ---
 
-## Output File Naming
+### Checkpoint Resume
 
-If you choose to translate `transcript_zh.xlsx`, the output will be `transcript_zh_translated_output.xlsx`.
+If the translation is interrupted due to network issues, API errors, or manual interruption (Ctrl+C), the script supports resuming from where it left off:
+
+**Resume workflow:**
+1. Re-run `batch_translate.py`
+2. The script automatically scans `workplace/_checkpoint/session.json` to detect unfinished progress
+3. Displays a summary of the last translation settings (Excel, worksheet, progress)
+4. Asks whether to resume:
+
+```
+============================================================
+  Unfinished translation progress detected
+============================================================
+  Excel: transcript_zh.xlsx
+  Worksheet: dialogue_experimental
+  Progress: 504/1000 entries
+  Glossary: glossary.xlsx
+============================================================
+
+Resume the previous translation? (Y/n):
+```
+
+5. Choose `Y` → automatically loads glossary settings, restores translated entries, and resumes from the interruption point
+6. Choose `n` → clears old checkpoint and starts a fresh translation
+
+> ⚠️ **Note**: The checkpoint resume feature **ensures the vast majority of translated progress is saved, but not 100%**. In extreme cases (such as abrupt shutdown), the last 1-2 batches that were completed but not yet written to checkpoint may not be recoverable.
 
 ---
 
-## Glossary and Custom Dictionary
+## Glossary & Custom Dictionary
 
 ### Excel Glossary
 
-Use an Excel file with the same format as the translation target. Column order:
+Use an Excel file with the same format as the translation target, column order:
 `english / translation / category / sub_category / source / notes / wiki_url`
 
 Only rows with a non-empty `translation` column are loaded as glossary entries.
 
 ### Built-in ADD_LIST
 
-Hard-coded terms can be added directly in `glossary.py` (these take priority over Excel entries when conflicts occur):
+Hardcoded terms can be written directly in `glossary.py` (takes priority over Excel when there's a conflict):
 
 ```python
 ADD_LIST: dict[str, str] = {
@@ -130,16 +194,16 @@ ADD_LIST: dict[str, str] = {
     "OSRS": "OSRS",
     "RuneLite": "RuneLite",
     "RuneLingual": "RuneLingual",
-    # Add your own entries, for example:
+    # Add your own, e.g.:
     # "Saradomin": "萨拉多明",
 }
 ```
 
 ### Built-in IGNORE_LIST
 
-Common nouns that are easily mistranslated are pre-excluded in `glossary.py`'s `IGNORE_LIST` to prevent AI from incorrectly treating them as terminology.
+Some common nouns that are prone to mistranslation have been pre-excluded in `glossary.py`'s `IGNORE_LIST` to prevent the AI from incorrectly treating them as terminology.
 
-**Example (in `glossary.py`):**
+**Example (located in `glossary.py`):**
 
 ```python
 IGNORE_LIST: set[str] = {
@@ -150,96 +214,117 @@ IGNORE_LIST: set[str] = {
 }
 ```
 
-**How to add your own entries:**
+**How to add entries:**
 - Any common English word you don't want checked as terminology can be added
-- Entries are matched against **singular/plural and case variations** automatically (e.g., adding `Egg` will also ignore `Eggs`, `EGGS`)
-- Identical entries already present in the Excel glossary are also ignored
+- Adding a word also matches its **singular/plural/case** forms (e.g., adding `Egg` automatically filters `Eggs`, `EGGS`)
+- Entries with the same name already in the Excel glossary will also be ignored
 
 ---
 
 ## Template Matching (tm_matcher)
 
-⚠️ **This feature is not yet enabled** (the `TEMPLATES` list is empty). All entries are currently translated by AI.
+⚠️ **This feature is not yet enabled** (the `TEMPLATES` list is empty). All entries are currently handled entirely by AI translation.
 
-Template matching will be added in the **official release**. You will be able to define regex templates for automatic translation (e.g., `"Talk to (.+?)\."` → `"与{0}对话。"`), reducing API calls. Interested users can check `tm_matcher.py` for syntax details in advance.
+Template matching will be added in the **official release**. Users will then be able to define regex templates for automatic translation fill-in (e.g., `"Talk to (.+?)\\."` → `"与{0}对话。"`), reducing the number of API calls. Interested users can refer to the comments in `tm_matcher.py` to learn the syntax in advance.
 
 ---
 
-## Constants Configuration
+## Constants
 
-The following constants are defined at the top of `llm_translator.py`. **It is not recommended to change them unless you know what you are doing:**
+The following constants are located in `api_config.py` and `llm_translator.py`. **Do not change them unless you know exactly what you're doing:**
 
 | Constant | Default | Description |
-|----------|---------|-------------|
-| `BATCH_SIZE_LIMIT` | 100 | Maximum entries per batch API request |
-| `PARALLEL_LIMIT` | 10 | Maximum concurrent API requests |
-| `REQUEST_INTERVAL` | 1 | Interval in seconds between starting consecutive requests |
+|------|--------|------------------------------|
+| `BATCH_SIZE_LIMIT` | 100 | Max entries per API request batch (llm_translator.py) |
+| `MAIN_DEFAULT_LIMIT` | 10 | Main API default concurrency (api_config.py) |
+| `FALLBACK_DEFAULT_LIMIT` | 1 | Fallback API default concurrency (api_config.py) |
+| `REQUEST_INTERVAL` | 1 | Interval in seconds between requests from the same API (api_config.py) |
 
-> When adjusting `PARALLEL_LIMIT`, note that values that are too high may trigger API rate limits and actually slow down overall speed, while values that are too low cannot fully utilize parallelism. The default of 10 has been tested as the optimal balance.
+> When adjusting concurrency: you can set `APIx_PARALLEL_LIMIT` in `.env` for individual APIs, or modify the category defaults in `api_config.py`. Setting it too high may trigger API endpoint rate limits. The defaults of main=10 and fallback=1 have been tested as the optimal balance point.
 
 ---
 
 ## Performance Reference
 
-### Benchmark Data (DeepSeek V4 Flash, dusk时段)
+### Benchmarks (DeepSeek V4 Flash, evening hours)
 
-| Lines | Avg Cost | Duration (3 runs) |
-|-------|---------|-------------------|
+| Entries | Average Cost | Time (3 test runs) |
+|---------|---------------|----------------|
 | 500 | 0.01-0.02 USD | 329s, 467s, 353s |
-| 2000 | 0.06-0.07 USD | 801s, 746s, 696s |
-| 5000 | 0.14 USD | 2084s, 1465s, 2170s |
+| 2,000 | 0.06-0.07 USD | 801s, 746s, 696s |
+| 5,000 | 0.14 USD | 2084s, 1465s, 2170s |
+| 75,000 | 2.39 USD | 8 hours |
 
-### Cost Analysis
+### Benchmarks (DeepSeek V4 Flash, Paid vs Free API Speed Comparison)
 
-Translation costs align closely with estimates. Based on $0.14 USD for 5,000 lines, **75,000 lines are estimated at ~$2.1 USD**.
+Using paid API as the baseline (1x), the following shows the relative time required for a free API to translate a single batch (100 entries). If you have additional benchmark data, contributions are welcome.
 
-### Time-of-Day Impact and Variance (Estimated)
+| API Source | Nvidia (Free) |
+|----------|:-------------:|
+| Relative Time |     1-5x      |
 
-- **Daytime is 50-70% slower than nighttime**: OpenRouter's aggregation platform sees higher concurrent usage during the Asia/Europe-America overlap period, significantly increasing API response times. Large-scale translations are recommended during off-peak nighttime hours.
-- **~20% variance within same batch size**: Each request on OpenRouter may be routed to different upstream providers or GPU nodes, combined with sentence length variation within batches, causing random timing fluctuations for the same line count.
+> 💡 **Usage tip**: Free APIs are considerably slower and are only recommended as a supplement to paid APIs for large-scale translations (e.g., 2,000+ entries). Since the multi-API round-robin dispatcher automatically distributes tasks to all available APIs, using free APIs for small batches (e.g., 500 entries) may proportionally slow down overall progress.
+
+### Time-of-Day Impact & Fluctuation (Speculative)
+
+- **Daytime is ~20% slower than late night**: OpenRouter's aggregation platform has more users during overlapping Asia/Europe hours, significantly increasing API endpoint response times. Large-scale translation is recommended during off-peak late-night hours.
+- **Same-batch fluctuation of ~±30%**: Each request on OpenRouter may be routed to a different upstream provider or GPU node, combined with varying sentence lengths within batches and different retry counts, resulting in random time variance for the same translation volume.
 
 ---
 
 ## Troubleshooting
 
-### API Issues
+### API Related
 
-**Q: I get `ImportError: No module named 'openai'`**
-<br>A: Dependencies are not installed. Run `pip install openai pandas openpyxl python-dotenv`.
+**Q: After running, `ImportError: No module named 'openai'` appears**
+<br>A: Dependencies not installed. Run `pip install openai pandas openpyxl python-dotenv`.
 
-**Q: I get `ValueError: Please set API_KEY environment variable or configure it in the .env file`**
+**Q: `ValueError: Please set the API_KEY environment variable or set it in the .env file` appears**
 <br>A: You forgot to create the `.env` file. Copy `.env.example` to `.env` and fill in your API Key.
 
 **Q: API requests keep failing or timing out**
-<br>A: Check that `BASE_URL` and `MODEL` in `.env` are correct. If using OpenRouter, verify your account balance is sufficient. You can also try lowering `PARALLEL_LIMIT` to 5 to reduce rate limit risk.
+<br>A: Check that `BASE_URL` and `MODEL` in `.env` are correct. If using OpenRouter, verify your account balance is sufficient. You can also try lowering the concurrency of your main/fallback APIs to reduce rate limit risk.
 
-**Q: Translation is much slower than expected**
-<br>A: First check the time of day — daytime being 50-70% slower than nighttime is normal. If it's still slow at night, check your network connection or try switching API endpoints.
+**Q: Translation speed is much slower than expected**
+<br>A: First check the time of day — daytime being ~20% slower than late night is normal. If it's still slow at night, check your network connection or try switching API endpoints.
 
-### Terminology Issues
+### Terminology Related
 
-**Q: The review report contains many unfamiliar terminology issues**
-<br>A: Common nouns may be incorrectly flagged as terminology. Check your Excel glossary for entries that shouldn't be there, or add the word to `IGNORE_LIST` in `glossary.py`.
+**Q: The review report has many terminology issues I don't recognize**
+<br>A: Common nouns may be incorrectly treated as terminology. Check your Excel glossary for unintended entries, or add the word to `glossary.py`'s `IGNORE_LIST`.
 
 **Q: I added a term but the AI didn't use it**
-<br>A: Check if the `translation` column in your Excel glossary has a value (only rows with a non-empty `translation` column are loaded). If from `ADD_LIST`, verify the spelling and case match exactly.
+<br>A: Check that the `translation` column in your glossary Excel is non-empty (only rows with a non-empty translation column are loaded). For `ADD_LIST` entries, verify spelling and capitalization are exactly correct.
 
-**Q: `"Eggs"` is in IGNORE_LIST but still shows up as an issue**
-<br>A: Confirm you're using the latest version of `glossary.py` where `IGNORE_LIST` uses normalized matching (adding `Egg` will filter `Eggs`, `EGGS`, etc.). If you also have an `"Eggs"` entry in your Excel glossary, remove it from there as well.
+**Q: "Eggs" is in IGNORE_LIST but still shows up as an issue**
+<br>A: Make sure your `glossary.py` is the latest version — `IGNORE_LIST` now uses normalized matching (adding `Egg` automatically filters `Eggs`, `EGGS`, etc.). If you also have an `"Eggs"` entry in the Excel glossary, remove it from Excel as well.
 
-### File Issues
+### File Related
 
-**Q: No output file was generated**
-<br>A: Check if the target Excel already has translations (non-empty `translation` column). If everything is already translated, the script will skip that sheet. Try selecting a range option other than "All untranslated entries".
+**Q: No output files were generated after translation**
+<br>A: Check whether the target Excel already has translations (non-empty `translation` column). If all entries are already translated, the script skips the worksheet. Try selecting a range option other than "All untranslated".
 
 **Q: The output `_translated_output.xlsx` won't open**
-<br>A: Make sure the file isn't being held open by another program (e.g., Excel). If it still won't open, an error may have occurred during translation — check the terminal output for error messages.
+<br>A: Make sure the file isn't locked by another program (e.g., Excel). If it still won't open, an error may have occurred during translation — check the terminal output for error messages.
 
-**Q: `progress.json` was not automatically deleted**
-<br>A: The script deletes it on normal completion. If the script was interrupted, `progress.json` is preserved for checkpoint resumption. Manually deleting it won't affect functionality.
+**Q: The `_checkpoint/` directory wasn't auto-deleted**
+<br>A: It's automatically deleted when the script completes normally. If the script was forcibly interrupted, `_checkpoint/` is preserved for future resume. Manually deleting it won't affect functionality.
+
+### Checkpoint Resume Related
+
+**Q: Progress is not detected when resuming**
+<br>A: Resume depends on `workplace/_checkpoint/session.json`. If you manually moved files, you need to move the entire `_checkpoint/` directory together. If `session.json` was manually deleted, the resume feature will not work.
+
+**Q: Some translations are missing after resuming**
+<br>A: As noted in the "Checkpoint Resume" section, in extreme cases (such as abrupt shutdown) the last 1-2 batches may not be saved. This is normal — simply re-translate the missing entries.
+
+**Q: The target Excel has been modified since the last run — can I still resume?**
+<br>A: Resume relies on recorded selected indices (`selected_indices`). If the target Excel's content or entry order has changed, the indices may no longer match. It's recommended to choose "No" and start a fresh translation.
+
+---
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
+This project is licensed under GPL v3. See the [LICENSE](LICENSE) file for details.
 
 Copyright (c) 2026 lck3141592654

@@ -8,29 +8,43 @@
 
 ## 概述
 
-這是一套專為大規模遊戲文本翻譯設計的 AI 自動化管線，位於 `updater/experimental/` 目錄下。
+這是一套專為大規模遊戲文本翻譯設計的 AI 自動化管線。腳本目錄可任意放置，無需特定專案結構。
 
-> ⚠️ **測試版公告**：本工具目前為測試階段，暫時只支援**簡體中文**翻譯。繁體中文及其他語言將在正式版中支援。
+> ⚠️ **測試版公告**：本工具目前為測試階段，暫時只支援**簡體中文**翻譯。其他語言將在正式版中支援。
+
+## 最近更新 (18/6/2026)，更新詳情請看 [Changelog](Changelog.md)
+- 新增多 API Key 並行作業，自動輪流分配任務並處理 429 限流
+- 新增斷點續傳，翻譯中斷後重新執行腳本即可從中斷處繼續
+- 新增自動萃取術語庫功能，從目標 Excel 的 name/manual 工作表自動篩選，無需額外準備
+- 統一 workplace/ 工作目錄，所有輸入輸出集中管理，簡化操作流程
+- 重譯功能擴充為三層檢查：術語比對、佔位符誤翻檢測、翻譯失敗檢測
+- 修正術語誤報：同一句內含重疊字串時（如「Lord Hosidius」與「Hosidius」），長術語翻譯正確即不再對短術語誤報
+- 強化互動介面：顯示各批次所用 API、細化重譯統計數據、補全各階段時間戳
+- 擴充內建術語庫（ADD_LIST）與排除清單（IGNORE_LIST）條目
 
 ### 特色
 
-- **極低成本**：搭配 DeepSeek V4 Flash，75000 條對話翻譯成本約 **2.1 美元**
-- **術語強制準確**：透過腳本輔助，AI 對人名/地名/物品名等專有名詞的翻譯準確率達 **99% 以上**。而Gemini的Gem功能或Qwen的專案之類的功能即使配合優秀的提示詞，在缺少腳本的輔助下，錯翻專有名詞的機率也不低。
-- **互動式操作**：支援選擇語言、工作表、條目範圍
+- **極低成本**：搭配 DeepSeek V4 Flash，75000 條對話翻譯成本約 **2.39 美元**
+- **術語強制準確**：透過腳本輔助，AI 對人名/地名/物品名等專有名詞的翻譯準確率達 **99% 以上**。而 Gemini 的 Gem 功能或 Qwen 的專案之類的功能即使配合優秀的提示詞，在缺少腳本的輔助下，仍不時會錯翻專有名詞。
+- **互動式操作**：支援選擇工作表、條目範圍
 - **非同步並行**：同時發送多個 API 請求，大幅縮短翻譯時間
-- **自動審查**：自動檢查術語使用情況，產出審查報告
+- **中斷續傳**：翻譯過程中若因網路問題或人手中斷，重新執行腳本即可從中斷處繼續，無需從頭開始
+- **自動審查**：三層檢查（術語 / 佔位符 / 未翻譯），產出彩色標示的審查報告
+- **多 API 支援**：支援同時使用多個 API Key（主/副分類），輪流分配任務，自動處理 429 限流（冷卻/永久停用），最大化翻譯吞吐量
 
 ### 檔案結構
 
 | 檔案 | 用途                              |
 |---|---------------------------------|
 | `batch_translate.py` | **主控腳本** — 互動式操作入口              |
-| `glossary.py` | 讀取術語庫 Excel 並輸出字典               |
+|`glossary.py` | 讀取術語庫 Excel 或自動萃取術語庫 + 輸出審查檔|
 | `tm_matcher.py` | 模板化比對（**尚未啟用**，將在正式版加入）         |
 | `llm_translator.py` | **AI 批次翻譯核心**，非同步並行調用           |
-| `enforcer.py` | **術語強制檢查**，自動修正+產出審查報告          |
-| `.env` | 你的 API 設定，你需自行複製.env.example並刪去".example" |
+| `enforcer.py` | **三層強制檢查**（術語/佔位符/未翻譯），自動修正+產出彩色審查報告 |
+| `api_config.py` | 多 API 配置解析，支援主/副分類、類別預設並發、個別覆蓋 |
+| `.env` | API 設定檔，支援多 API 編號格式及舊版單一 API 格式 |
 | `.env.example` | 設定範本                            |
+| `workplace/` | **工作目錄**（腳本自動建立），所有輸入輸出統一存放於此  |
 
 ### 四階段流程
 
@@ -39,7 +53,7 @@ batch_translate.py → 依序執行：
 ① glossary.py      載入術語庫
 ② tm_matcher.py    模板參數比對 ⚠️ 尚未啟用，將在正式版加入
 ③ llm_translator.py AI 批次翻譯（非同步並行）
-④ enforcer.py      術語強制檢查 + 審查報告
+④ enforcer.py      三層強制檢查（術語/佔位符/未翻譯）+ 彩色審查報告
 ```
 
 ---
@@ -56,59 +70,107 @@ pip install openpyxl pandas openai python-dotenv
 
 本工具支援任何 **OpenAI 相容 API**。推薦的選項：
 
-| 平台 | 推薦模型 | 成本 |
-|------|---------|------|
-| [OpenRouter](https://openrouter.ai/) | `deepseek/deepseek-v4-flash` | 極低 |
-| DeepSeek 官方 | `deepseek-chat` | 極低 |
-| OpenAI | `gpt-4o-mini` | 較高 |
+| 平台                                            | 推薦模型                            | 成本 |
+|-----------------------------------------------|---------------------------------|----|
+| [OpenRouter](https://openrouter.ai/)          | `deepseek/deepseek-v4-flash`    | 極低 |
+| [DeepSeek 官方](https://platform.deepseek.com/) | `deepseek-v4-flash`                 | 極低 |
+| [Nvidia (免費API)](https://build.nvidia.com/)   | `deepseek-ai/deepseek-v4-flash` | 免費 |
 
 ### 2. 建立 `.env` 檔案
 
-複製 `.env.example` 為 `.env`，填入你的設定：
+複製 `.env.example` 為 `.env`，填入你的設定。支援兩種格式，以下為範本：
 
+#### 多 API 格式（推薦）
+
+```env
+# 主 API（付費，預設並發=10）
+API1_TYPE=main
+API1_PARALLEL_LIMIT=x (如果你想設置獨立並發數就增加這個參數，填入數字)
+API1_MODEL_PROVIDER=openrouter
+API1_MODEL=deepseek/deepseek-v4-flash
+API1_API_KEY=sk-your_api_key_here
+API1_BASE_URL=https://openrouter.ai/api/v1
+
+# 副 API（免費，預設並發=1）
+API2_TYPE=fallback
+API2_PARALLEL_LIMIT=x (如果你想設置獨立並發數就增加這個參數，填入數字)
+API2_MODEL_PROVIDER=nvidia
+API2_MODEL=deepseek-ai/deepseek-v4-flash
+API2_API_KEY=nvapi-your_free_key_here
+API2_BASE_URL=https://integrate.api.nvidia.com/v1
+```
+舊版單一 API 格式（向後相容）
 ```env
 API_KEY=sk-your_api_key_here
 MODEL_PROVIDER=openrouter
 MODEL=deepseek/deepseek-v4-flash
 BASE_URL=https://openrouter.ai/api/v1
 ```
+> 兩種格式可同時存在——若偵測到 `API1_` 設定，優先使用多 API 格式。每個 API 可選填 `APIx_PARALLEL_LIMIT` 覆蓋類別預設值。主 API 預設並發=10，副 API 預設並發=1。
 
 ---
 
-## 使用方法 (先將experimental文件夾放入Runelingual-Transcripts\updater內)
+## 使用方法
+
+將翻譯目標 Excel 和術語庫（可選）放入 `workplace/` 目錄，然後執行主控腳本。
 
 ### 執行主控腳本
 
 ```bash
-cd updater/experimental
+cd <腳本所在目錄>
 python batch_translate.py
 ```
+或直接運行 batch_translate.py。
 
 ### 互動步驟
 
 ```
-Step 1：選擇語言          → 從 draft/ 下的目錄名稱選擇（如 zh、fr）
-Step 2：選擇目標 Excel    → 選擇要翻譯的檔案
-Step 3：選擇術語庫        → 可選 Excel 術語庫或僅用內建詞典
-Step 4：選擇工作表        → 單選或多選
-Step 5：選擇翻譯範圍      → 全部未翻譯 / 前 N 條測試 / 指定行數
-Step 6：確認執行          → 顯示摘要後按 Y 確認
+Step 1：選擇目標 Excel    → 從 workplace/ 下列出所有 .xlsx 檔案
+Step 2：選擇術語庫        → 可選 Excel 術語庫、自動從目標 Excel 萃取、或跳過（只有 ADD_LIST 硬編碼術語）
+Step 3：選擇工作表        → 單選或多選
+Step 4：選擇翻譯範圍      → 全部未翻譯 / 前 N 條測試 / 指定行數
+Step 5：確認執行          → 顯示摘要後按 Y 確認
 ```
 
 ### 執行後產出
 
+所有輸出檔案統一放在 `workplace/` 目錄下：
+
 | 檔案 | 說明 |
 |------|------|
-| `{來源檔名}_translated_output.xlsx` | **翻譯完成檔案** |
-| `review_report.xlsx` | **審查報告**（需人工確認的條目） |
-| `progress.json` | 進度暫存（翻譯完成後自動刪除） |
+| `{來源檔名}_translated_output.xlsx` | **翻譯完成檔案**，位於 `workplace/` |
+| `review_report.xlsx` | **審查報告**（需人工確認的條目），位於 `workplace/` |
+| `_checkpoint/` | **中斷續傳暫存目錄**，位於 `workplace/`（翻譯完成後自動刪除） |
 
 ---
 
-## 輸出檔案命名規則
+### 中斷續傳
 
-假設你選擇翻譯 `transcript_zh.xlsx`，輸出為 `transcript_zh_translated_output.xlsx`。
+若翻譯過程中因網路斷線、API 錯誤、或人手中斷（Ctrl+C），腳本支援從中斷處繼續：
 
+**續傳流程：**
+1. 重新執行 `batch_translate.py`
+2. 腳本會自動掃描 `workplace/_checkpoint/session.json`，偵測未完成的進度
+3. 顯示上次的翻譯設定摘要（Excel、工作表、進度）
+4. 詢問是否繼續上次的翻譯：
+
+```
+============================================================
+  偵測到未完成的翻譯進度
+============================================================
+  Excel: transcript_zh.xlsx
+  工作表: dialogue_experimental
+  進度: 504/1000 條
+  術語庫: 术语库.xlsx
+============================================================
+
+是否繼續上次的翻譯？(Y/n):
+```
+
+5. 選擇 `Y` → 自動載入術語庫設定、還原已翻譯條目，從中斷處繼續
+6. 選擇 `n` → 清除舊暫存，進入全新翻譯流程
+
+> ⚠️ **注意**：中斷續傳功能**能確保保存絕大部分已翻譯進度，但並非 100%**。極端情況下（如突然關機），最近 1-2 批已完成但尚未寫入暫存的翻譯可能無法還原。
 ---
 
 ## 術語庫與自訂詞典
@@ -167,15 +229,16 @@ IGNORE_LIST: set[str] = {
 
 ## 常數設定
 
-以下常數位於 `llm_translator.py` 頂部，**除非你很清楚自己在做什麼，否則不建議改動**：
+以下常數位於 `api_config.py` 和 `llm_translator.py`，**除非你很清楚自己在做什麼，否則不建議改動**：
 
-| 常數 | 預設值 | 說明 |
-|------|--------|------|
-| `BATCH_SIZE_LIMIT` | 100 | 每批 API 請求的最大條數 |
-| `PARALLEL_LIMIT` | 10 | 同時進行的 API 請求數上限 |
-| `REQUEST_INTERVAL` | 1 | 每批請求啟動前的間隔秒數 |
+| 常數 | 預設值 | 說明                           |
+|------|--------|------------------------------|
+| `BATCH_SIZE_LIMIT` | 100 | 每批 API 請求的最大條數 (llm_translator.py)            |
+| `MAIN_DEFAULT_LIMIT` | 10 | 主 API 預設並發數（api_config.py）   |
+| `FALLBACK_DEFAULT_LIMIT` | 1 | 副 API 預設並發數（api_config.py）   |
+| `REQUEST_INTERVAL` | 1 | 同一 API 請求間隔秒數（api_config.py） |
 
-> 調整 `PARALLEL_LIMIT` 時請注意：數值過高可能觸發 API 端點的 Rate Limit，反而拖慢整體速度；數值過低則無法充分利用並行優勢。預設值 10 經過實測為最佳平衡點。
+> 調整並發數時請注意：可在 `.env` 中為個別 API 設 `APIx_PARALLEL_LIMIT`，或修改 `api_config.py` 中的類別預設值。數值過高可能觸發 API 端點的 Rate Limit。預設主 API=10、副 API=1 經過實測為最佳平衡點。
 
 ---
 
@@ -183,20 +246,27 @@ IGNORE_LIST: set[str] = {
 
 ### 實測數據（DeepSeek V4 Flash，黃昏時段）
 
-| 翻譯數量 | 平均成本 | 耗時（三次測試） |
-|---------|---------|----------------|
+| 翻譯數量 | 平均成本          | 耗時（三次測試） |
+|---------|---------------|----------------|
 | 500 條 | 0.01-0.02 USD | 329s, 467s, 353s |
 | 2000 條 | 0.06-0.07 USD | 801s, 746s, 696s |
-| 5000 條 | 0.14 USD | 2084s, 1465s, 2170s |
+| 5000 條 | 0.14 USD      | 2084s, 1465s, 2170s |
+|75000 條   | 2.39 USD      | 8hours     |
 
-### 成本分析
+### 實測數據（DeepSeek V4 Flash，付費 vs 免費 API 速度對比）
 
-翻譯成本與估算偏差不大，以 5000 條 0.14 美元推算，**75000 條約 2.1 美元**。
+以付費 API 為基準（1x），以下為免費 API 翻譯單一批次（100 條）所需的相對時間。如有更多實測數據，歡迎提供。
 
-### 時段影響與波動 (推測)
+| API 來源 | Nvidia（免費） |
+|----------|:----------:|
+| 相對耗時 |    1-5x    |
 
-- **白天比深夜慢 50-70%**：OpenRouter 聚合平台在亞洲/歐美重疊時段使用者較多，API 回應時間顯著增加。建議大規模翻譯在深夜離峰時段執行。
-- **同批次波動約 ±20%**：OpenRouter 內部每次請求被路由到的上游 provider 或 GPU 節點不同，加上批次內句子長短差異，導致相同數量的翻譯耗時有隨機波動。
+> 💡 **使用建議**：免費 API 速度較慢，僅建議在大規模翻譯（如 2000 條以上）時搭配付費 API 使用。由於多 API 輪流分配機制會自動將任務分配給所有可用 API，少量翻譯（如 500 條）中免費 API 的比重過高反而會拖慢總體進度。
+
+### 時段影響與波動（推測）
+
+- **白天比深夜慢 ~20%**：OpenRouter 聚合平台在亞洲/歐美重疊時段使用者較多，API 端點回應時間增加。建議大規模翻譯在深夜離峰時段執行。
+- **同批次波動約 ±30%**：OpenRouter 內部每次請求被路由到的上游供應商或 GPU 節點不同，加上批次內句子長短差異、重試次數不同，導致相同數量的翻譯耗時有隨機波動。
 
 ---
 
@@ -211,10 +281,10 @@ IGNORE_LIST: set[str] = {
 <br>A：忘記建立 `.env` 檔案。複製 `.env.example` 為 `.env`，填入你的 API Key。
 
 **Q：API 請求一直失敗或超時**
-<br>：檢查 `.env` 中的 `BASE_URL` 和 `MODEL` 是否正確。如果是 OpenRouter，確認帳戶餘額是否足夠。也可嘗試將 `PARALLEL_LIMIT` 調低至 5 來降低 Rate Limit 風險。
+<br>A：檢查 `.env` 中的 `BASE_URL` 和 `MODEL` 是否正確。如果是 OpenRouter，確認帳戶餘額是否足夠。也可嘗試調低主/副 API 的並發數來降低 Rate Limit 風險。
 
 **Q：翻譯速度比預期慢很多**
-<br>A：先確認時段——白天比深夜慢 50-70% 是正常現象。若深夜仍偏慢，可檢查網路連線或嘗試更換 API 端點。
+<br>A：先確認時段——白天比深夜慢 ~20% 是正常現象。若深夜仍偏慢，可檢查網路連線或嘗試更換 API 端點。
 
 ### 術語相關
 
@@ -235,8 +305,21 @@ IGNORE_LIST: set[str] = {
 **Q：輸出的 `_translated_output.xlsx` 打不開**
 <br>A：確認該檔案未被其他程式（如 Excel）佔用。若仍無法開啟，可能是翻譯過程中發生錯誤，檢查終端機輸出是否有錯誤訊息。
 
-**Q：`progress.json` 沒有被自動刪除**
-<br>A：腳本正常完成時會自動刪除。若腳本被強制中斷，`progress.json` 會保留下來，方便下次續傳。手動刪除不會影響功能。
+**Q：`_checkpoint/` 目錄沒有被自動刪除**
+<br>A：腳本正常完成時會自動刪除。若腳本被強制中斷，`_checkpoint/` 會保留下來，方便下次續傳。手動刪除不會影響功能。
+
+### 中斷續傳相關
+
+**Q：續傳時偵測不到進度**
+<br>A：續傳依賴 `workplace/_checkpoint/session.json`。如果你手動搬移檔案，需要將整個 `_checkpoint/` 目錄一併移動。如果手動刪除了 `session.json`，續傳功能將無法使用。
+
+**Q：續傳後部分翻譯遺失**
+<br>A：如「中斷續傳」章節所述，極端情況下（如突然關機）最近 1-2 批翻譯可能無法保存。這是正常現象，重新翻譯遺失的部分即可。
+
+**Q：續傳時目標 Excel 已修改，可以繼續嗎？**
+<br>A：續傳依賴記錄的選取索引（`selected_indices`）。如果目標 Excel 內容或條目順序已變更，索引可能對不上，建議選擇「否」開始全新翻譯。
+
+---
 
 ## 授權條款 (License)
 

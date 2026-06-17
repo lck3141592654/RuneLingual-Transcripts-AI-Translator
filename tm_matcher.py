@@ -1,5 +1,6 @@
 import re
 import pandas as pd
+from glossary import normalize_term
 
 TEMPLATES: list[dict] = [
     # ═══════════════════════════════════════════
@@ -27,19 +28,6 @@ TEMPLATES: list[dict] = [
     # 原文：Use X on Y → {0}=X(item), {1}=Y(target)
     # {"pattern": r"Use (.+?) on (.+?)\.",                "template": "在{1}上使用{0}。"},
 ]
-
-def normalize_term(term: str) -> str:
-    term = term.lower().strip()
-    term = re.sub(r"^(a|an|the)\s+", "", term)
-    # -ves → f (e.g. wolves → wolf)
-    term = re.sub(r"(?i)(?<=[a-z])ves$", "f", term)
-    # -ies → y (e.g. ponies → pony)
-    term = re.sub(r"(?i)(?<=[a-z])ies$", "y", term)
-    # -es → (e.g. boxes → box) before -s
-    term = re.sub(r"(?i)(?<=[a-z])es$", "", term)
-    # -s → (e.g. cats → cat) after -es
-    term = re.sub(r"(?i)(?<=[a-z])s$", "", term)
-    return term.strip()
 
 def match_and_fill(df: pd.DataFrame, glossary: dict) -> pd.DataFrame:
     df = df.copy()
