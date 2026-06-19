@@ -44,6 +44,10 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 | `.env.example` | Configuration template |
 | `workplace/` | **Working directory** (auto-created), all inputs and outputs stored here |
 
+> The `workplace/` directory contains the following subdirectories:
+> - `_checkpoint/` — Checkpoint data for resume (auto-deleted after completion)
+> - `_debugmessage/` — Low translation rate debug logs (auto-generated, displayed and cleared on next startup)
+
 ### Four-Stage Pipeline
 
 ```
