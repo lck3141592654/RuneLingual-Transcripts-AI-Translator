@@ -14,7 +14,10 @@ ADD_LIST: dict[str, str] = {
     "Lord Arceuus": "阿西乌斯领主", "Historical Archive": "历史档案室", "White Wolf Mountain": "白狼山",
     "Kourend Council": "库兰德议会", "Runecrafting altar": "符石祭坛", "Runecraft altar": "符石祭坛",
     "River Molch": "莫尔奇河", "Proselyte Temple Knight": "皈依者圣殿骑士", "Brimhaven Agility Arena": "布尔哈文敏捷竞技场",
-    "Arceuus Library": "阿西乌斯图书馆",
+    "Arceuus Library": "阿西乌斯图书馆", "Saradomin": "萨拉多明", "Guthix": "古斯", "Zamorak": "扎莫拉克",
+    "Armadyl": "阿玛杜尔", "Bandos": "班多斯", "Zaros": "扎罗斯", "Tumeken": "图梅肯",
+    "Elidinis": "伊莉迪尼斯", "Jas": "贾斯", "Marimbo": "马里姆博", "Ralos": "拉洛斯",
+    "Ranul": "拉努尔", "Kayzertief": "凯泽提夫", "Xeric": "泽里克", "Xerician": "泽里克西亚",
 }
 
 IGNORE_LIST: set[str] = set()

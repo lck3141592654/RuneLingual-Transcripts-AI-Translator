@@ -150,10 +150,26 @@ async def _retry_round(client, model_name, pool, glossary_text, rnd):
                 all_results.extend(json.loads(content))
                 # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
                 break
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                # ↓ 嘗試用 json_repair 修復
+                try:
+                    from json_repair import repair_json
+                    repaired = repair_json(content)
+                    if repaired:
+                        fixed = json.loads(repaired)
+                        if isinstance(fixed, list):
+                            all_results.extend(fixed)
+                            print(f"    ⚠️ JSON 修復成功")
+                            break
+                except Exception:
+                    pass
+                # ↑ 修復結束
+                print(f"    JSON 解析失敗 (嘗試 {attempt + 1}/3): {e}")
+                print(f"    原始回傳內容前 200 字: {content[:200] if 'content' in dir() else 'N/A'}")
                 if attempt < 2:
                     await asyncio.sleep(2)
-            except Exception:
+            except Exception as e:
+                print(f"    API 錯誤 (嘗試 {attempt + 1}/3): {e}")
                 if attempt < 2:
                     await asyncio.sleep(5)
         else:

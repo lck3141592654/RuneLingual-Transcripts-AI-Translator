@@ -246,6 +246,31 @@ def main():
     print(f"      工作目錄: {_get_workplace()}")
     print(SEP)
 
+    # ── 檢查上次的 debug 訊息 ──
+    debug_dir = _get_workplace() / "_debugmessage"
+    if debug_dir.exists():
+        debug_files = sorted(debug_dir.glob("debug_*.json"))
+        if debug_files:
+            print(f"\n{'=' * 60}")
+            print(f"  ⚠️ 上次執行有低翻譯率記錄")
+            print(f"{'=' * 60}")
+            for f in debug_files:
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    print(f"  ─ [{data.get('api_id', '?')}] {data.get('model', '?')} ─")
+                    print(f"    批次大小: {data.get('batch_size')}, "
+                          f"成功: {data.get('success')}/{data.get('returned')}, "
+                          f"翻譯率: {data.get('rate', 0):.1%}")
+                    preview = data.get("response_preview", "")
+                    if preview:
+                        print(f"    回傳內容:\n{preview}")
+                except Exception as e:
+                    print(f"  無法讀取 {f.name}: {e}")
+            print(f"{'=' * 60}\n")
+        import shutil
+        shutil.rmtree(debug_dir)
+        print(f"  已清除 debug 訊息\n")
+
     # ── 續傳檢測 ──
     exist_session = find_existing_progress()
     if exist_session:

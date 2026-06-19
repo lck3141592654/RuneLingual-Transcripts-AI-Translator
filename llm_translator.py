@@ -170,7 +170,7 @@ def delete_checkpoint_files(output_dir):
 
 # ── LLM API 調用 ──
 
-async def _translate_batch(client, model_name, batch, glossary):
+async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
     """發送單一批次到 LLM API 進行翻譯"""
     relevant = get_relevant_glossary(batch, glossary)
     glossary_str = "\n".join([f"  {e} → {c}" for e, c in relevant]) if relevant else "  无"
@@ -199,9 +199,72 @@ async def _translate_batch(client, model_name, batch, glossary):
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
             text = re.sub(r"\n```$", "", text)
             results = json.loads(text)
+
+            # 方法一：先試明確的 key 名稱
+            if isinstance(results, dict):
+                if "translations" in results:
+                    results = results["translations"]
+                elif "translated" in results:
+                    results = results["translated"]
+                elif "data" in results:
+                    results = results["data"]
+                elif "object" in results and isinstance(results["object"], dict) and "translated" in results["object"]:
+                    results = results["object"]["translated"]
+            # 方法二：如果還是 dict，自動搜尋 index+translation 陣列
+            if isinstance(results, dict):
+                found = None
+                for key, value in results.items():
+                    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict) \
+                            and "index" in value[0] and "translation" in value[0]:
+                        found = value
+                        break
+                if found is None:
+                    for key, value in results.items():
+                        if isinstance(value, dict):
+                            for k2, v2 in value.items():
+                                if isinstance(v2, list) and len(v2) > 0 and isinstance(v2[0], dict) \
+                                        and "index" in v2[0] and "translation" in v2[0]:
+                                    found = v2
+                                    break
+                if found is not None:
+                    results = found
+            # ：如果 dict 本身就有 index+translation，視為單一條目
+            if isinstance(results, dict) and "index" in results and "translation" in results:
+                results = [results]
+                print(f"    [{api_id}] ⚠️ API 回傳單一物件而非陣列")
+                print(f"    [{api_id}] ⚠️ 如果多次顯示此訊息，代表此 API 不適合翻譯任務，建議從 .env 移除或更換模型")
+            if isinstance(results, list) and len(results) > 0:
+                success = sum(1 for r in results if isinstance(r, dict) and r.get("translation"))
+                rate = success / len(batch) if len(batch) > 0 else 0
+                if rate < 0.25:
+                    debug_dir = Path(__file__).parent / "workplace" / "_debugmessage"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    uid = uuid.uuid4().hex[:4]
+                    (debug_dir / f"debug_{ts}_{uid}.json").write_text(
+                        json.dumps({
+                            "api_id": api_id,
+                            "model": model_name,
+                            "batch_size": len(batch),
+                            "returned": len(results),
+                            "success": success,
+                            "rate": round(rate, 3),
+                            "response_preview": text[:3000]
+                        }, ensure_ascii=False, indent=2), encoding="utf-8")
+                    print(f"    [{api_id}] ⚠️ 低翻譯率 {rate:.1%}（{success}/{len(batch)}），已儲存 debug 訊息")
+            if isinstance(results, list) and len(results) > 0:
+                null_count = sum(1 for r in results if r.get("translation") is None)
+                if null_count > len(results) * 0.5:
+                    print(f"    [{api_id}] 警告：{null_count}/{len(results)} 條翻譯為 null")
+            if isinstance(results, list):
+                if results and not all("index" in r and "translation" in r for r in results):
+                    print(f"    [{api_id}] 警告：JSON 陣列中缺少 index/translation 欄位")
+                    print(f"    回傳內容前 200 字: {text[:200]}")
+            if isinstance(results, dict):
+                if "translations" not in results and "index" not in results:
+                    print(f"    [{api_id}] 警告：JSON 物件結構異常（無 translations 也無 index）")
+                    print(f"    回傳內容前 200 字: {text[:200]}")
             # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
-            if isinstance(results, dict) and "translations" in results:
-                results = results["translations"]
             if isinstance(results, dict):
                 results = [results]
             return results
@@ -209,6 +272,22 @@ async def _translate_batch(client, model_name, batch, glossary):
             error_str = str(e).lower()
             if "429" in error_str or "rate" in error_str:
                 raise
+            # ↓ 嘗試用 json_repair 修復 JSON 格式錯誤
+            if isinstance(e, json.JSONDecodeError):
+                try:
+                    from json_repair import repair_json
+                    repaired = repair_json(text)
+                    if repaired:
+                        results = json.loads(repaired)
+                        print(f"    [{api_id}] ⚠️ JSON 修復成功")
+                        if isinstance(results, list):
+                            return results
+                        if isinstance(results, dict) and "translations" in results:
+                            return results["translations"]
+                except Exception:
+                    pass
+            # ↑ 修復結束
+            print(f"    [{api_id}] API 錯誤 (嘗試 {attempt + 1}/3): {e}")
             if attempt < 2:
                 await asyncio.sleep(5)
 
@@ -270,7 +349,7 @@ async def _translate_all_async(df, glossary, output_dir, pending):
             _timestamp(f"批次 {batch_num}/{total_batches} 開始 ({len(batch)} 条) [{cfg.api_id} {cfg.model}]")
 
             try:
-                results = await _translate_batch(ws["client"], cfg.model, batch, glossary)
+                results = await _translate_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
                 new_backup = {}
                 for res in results:
                     idx = res.get("index")

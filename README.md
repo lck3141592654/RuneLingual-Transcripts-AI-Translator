@@ -12,15 +12,14 @@
 
 > ⚠️ **測試版公告**：本工具目前為測試階段，暫時只支援**簡體中文**翻譯。其他語言將在正式版中支援。
 
-## 最近更新 (18/6/2026)，更新詳情請看 [Changelog](Changelog.md)
-- 新增多 API Key 並行作業，自動輪流分配任務並處理 429 限流
-- 新增斷點續傳，翻譯中斷後重新執行腳本即可從中斷處繼續
-- 新增自動萃取術語庫功能，從目標 Excel 的 name/manual 工作表自動篩選，無需額外準備
-- 統一 workplace/ 工作目錄，所有輸入輸出集中管理，簡化操作流程
-- 重譯功能擴充為三層檢查：術語比對、佔位符誤翻檢測、翻譯失敗檢測
-- 修正術語誤報：同一句內含重疊字串時（如「Lord Hosidius」與「Hosidius」），長術語翻譯正確即不再對短術語誤報
-- 強化互動介面：顯示各批次所用 API、細化重譯統計數據、補全各階段時間戳
-- 擴充內建術語庫（ADD_LIST）與排除清單（IGNORE_LIST）條目
+## 最近更新 (19/6/2026)，更新詳情請看 [Changelog](Changelog.md)
+- 強化除錯訊息：API 錯誤、JSON 解析失敗、低翻譯率均顯示具體原因，不再靜默吞掉
+- 新增智慧 JSON 提取：依序嘗試已知 key 名稱，未命中時自動搜尋巢狀結構中含 index+translation 的陣列
+- 新增 API 適用性檢測：單一物件回傳時提示該 API 不適合翻譯任務，建議更換
+- 新增低翻譯率 debug 記錄：翻譯率低於 25% 時將完整回傳內容儲存至 workplace/_debugmessage/
+- 新增 JSON 修復機制：引入 json_repair 自動修復格式不完整的 JSON 回傳（缺少逗號/冒號等），減少重試次數
+- 改善 API 兼容性：Nvidia、opencode、OpenRouter 等多種格式差異現已統一處理
+- 新增依賴項：json-repair，執行 pip install json-repair 安裝
 
 ### 特色
 
@@ -39,7 +38,7 @@
 | `batch_translate.py` | **主控腳本** — 互動式操作入口              |
 |`glossary.py` | 讀取術語庫 Excel 或自動萃取術語庫 + 輸出審查檔|
 | `tm_matcher.py` | 模板化比對（**尚未啟用**，將在正式版加入）         |
-| `llm_translator.py` | **AI 批次翻譯核心**，非同步並行調用           |
+| `llm_translator.py` | **AI 批次翻譯核心**，非同步並行調用，含智慧 JSON 提取與 json_repair 修復 |
 | `enforcer.py` | **三層強制檢查**（術語/佔位符/未翻譯），自動修正+產出彩色審查報告 |
 | `api_config.py` | 多 API 配置解析，支援主/副分類、類別預設並發、個別覆蓋 |
 | `.env` | API 設定檔，支援多 API 編號格式及舊版單一 API 格式 |
@@ -61,7 +60,7 @@ batch_translate.py → 依序執行：
 ## 安裝
 
 ```bash
-pip install openpyxl pandas openai python-dotenv
+pip install openpyxl pandas openai python-dotenv json-repair
 ```
 
 ## 設定
@@ -70,11 +69,12 @@ pip install openpyxl pandas openai python-dotenv
 
 本工具支援任何 **OpenAI 相容 API**。推薦的選項：
 
-| 平台                                            | 推薦模型                            | 成本 |
-|-----------------------------------------------|---------------------------------|----|
-| [OpenRouter](https://openrouter.ai/)          | `deepseek/deepseek-v4-flash`    | 極低 |
-| [DeepSeek 官方](https://platform.deepseek.com/) | `deepseek-v4-flash`                 | 極低 |
-| [Nvidia (免費API)](https://build.nvidia.com/)   | `deepseek-ai/deepseek-v4-flash` | 免費 |
+| 平台                                                | 推薦模型                            | 成本 |
+|---------------------------------------------------|---------------------------------|----|
+| [OpenRouter](https://openrouter.ai/)              | `deepseek/deepseek-v4-flash`    | 極低 |
+| [DeepSeek 官方](https://platform.deepseek.com/)     | `deepseek-v4-flash`                 | 極低 |
+| [Nvidia (免費API)](https://build.nvidia.com/)       | `deepseek-ai/deepseek-v4-flash` | 免費 |
+| [Opencode Zen (免費API)](https://opencode.ai/zen/) | `deepseek-v4-flash-free` | 免費 |
 
 ### 2. 建立 `.env` 檔案
 
@@ -253,13 +253,13 @@ IGNORE_LIST: set[str] = {
 | 5000 條 | 0.14 USD      | 2084s, 1465s, 2170s |
 |75000 條   | 2.39 USD      | 8hours     |
 
-### 實測數據（DeepSeek V4 Flash，付費 vs 免費 API 速度對比）
+### 實測數據（付費 vs 免費 API 速度對比）
 
-以付費 API 為基準（1x），以下為免費 API 翻譯單一批次（100 條）所需的相對時間。如有更多實測數據，歡迎提供。
+以付費 API DeepSeek V4 Flash 為基準（1x），以下為免費 API 翻譯單一批次（100 條）所需的相對時間。如有更多實測數據，歡迎提供。
 
-| API 來源 | Nvidia（免費） |
-|----------|:----------:|
-| 相對耗時 |    1-5x    |
+| API 來源 | Nvidia（DS v4 flash） |Opencode（DS v4 flash） | Openrouter（gpt-oss-120b） |
+|----------|:-------------------:|:--------------------:|:------------------------:|
+| 相對耗時 |       1-1.5x        |        1-1.5x        |         1.5-2x           |
 
 > 💡 **使用建議**：免費 API 速度較慢，僅建議在大規模翻譯（如 2000 條以上）時搭配付費 API 使用。由於多 API 輪流分配機制會自動將任務分配給所有可用 API，少量翻譯（如 500 條）中免費 API 的比重過高反而會拖慢總體進度。
 
@@ -275,7 +275,7 @@ IGNORE_LIST: set[str] = {
 ### API 相關
 
 **Q：執行後出現 `ImportError: No module named 'openai'`**
-<br>A：尚未安裝依賴，執行 `pip install openai pandas openpyxl python-dotenv`。
+<br>A：尚未安裝依賴，執行 `pip install openai pandas openpyxl python-dotenv json-repair`。
 
 **Q：出現 `ValueError: 请设定 API_KEY 环境变量或在 .env 档案中设定`**
 <br>A：忘記建立 `.env` 檔案。複製 `.env.example` 為 `.env`，填入你的 API Key。
@@ -318,6 +318,17 @@ IGNORE_LIST: set[str] = {
 
 **Q：續傳時目標 Excel 已修改，可以繼續嗎？**
 <br>A：續傳依賴記錄的選取索引（`selected_indices`）。如果目標 Excel 內容或條目順序已變更，索引可能對不上，建議選擇「否」開始全新翻譯。
+
+### 除錯相關
+
+**Q：出現 `[APIx] ⚠️ 低翻譯率 1.1%（1/94），已儲存 debug 訊息`**
+<br>A：該 API 的翻譯能力不足，94 條中只成功翻譯了 1 條。檢查 `workplace/_debugmessage/` 目錄下的 debug 檔案檢視完整回傳內容，建議更換其他模型。
+
+**Q：出現 `[APIx] ⚠️ API 回傳單一物件而非陣列`**
+<br>A：該 API 不支援批次回傳多條翻譯，只回了單一條目。如果多次顯示此訊息，建議從 `.env` 移除或更換模型。
+
+**Q：出現 `JSON 修復成功`**
+<br>A：模型回傳的 JSON 格式有微小瑕疵（如缺少逗號或冒號），`json_repair` 已自動修復，不影響翻譯結果。
 
 ---
 

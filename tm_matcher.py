@@ -17,6 +17,8 @@ TEMPLATES: list[dict] = [
     # {"pattern": r"Your task is to kill (.+)\.",    "template": "你的任务是杀死{0}。"},
     # {"pattern": r"Talk to (.+)\.",                 "template": "与{0}交谈。"},
     # {"pattern": r"Search (.+)\.",                  "template": "搜索{0}。"},
+    # {"pattern": r"You don't have to worry, I'm not a priest. I won't try to convert you to (.+)\.",
+    #  "template": "您不需要担1心，我2不是祭司。我3不会试图4让你改信{0}。"},
 
     # ─── 多變量（用 {0}{1} 調整語序） ───
     # 原文：kill X in Y → {0}=X(target), {1}=Y(location)

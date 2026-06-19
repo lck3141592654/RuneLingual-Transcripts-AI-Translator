@@ -12,16 +12,14 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 18/6/2026, see [Changelog](Changelog.md) for details
-- Added multi-API parallel support with round-robin task distribution and automatic 429 rate-limit handling
-- Added checkpoint resume — re-run the script to continue from where it left off after interruption
-- Added auto-extract glossary from the target Excel's name and manual sheets, no separate file required
-- Unified workplace/ directory for all inputs and outputs, simplifying the workflow
-- Extended retranslation to three-layer checks: terminology, placeholder corruption, and untranslated entries
-- Fixed false positives in review report: when overlapping terms exist (e.g. “Lord Hosidius” vs “Hosidius”), correct longer-term translation no longer triggers a false alarm on the shorter term
-- Enhanced interactive UI: per-batch API indicators, detailed retranslation stats, and comprehensive stage timestamps
-- Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
-
+## Latest Update on 19/6/2026, see [Changelog](Changelog.md) for details
+- Enhanced debug output: API errors, JSON parse failures, and low translation rates now show detailed diagnostics instead of being silently ignored
+- Added smart JSON extraction: tries known key names first, then auto-searches nested structures for arrays containing index+translation fields
+- Added API compatibility detection: alerts when an API returns single objects instead of arrays, recommending replacement
+- Added low-rate debug logging: saves full API response to workplace/_debugmessage/ when translation rate is below 25% for direct inspection
+- Added JSON repair: uses json_repair to fix malformed JSON responses (missing commas/colons, etc.), reducing retries
+- Improved API compatibility: unified handling of format differences across Nvidia, opencode, OpenRouter, and other providers
+- New dependency: json-repair — run pip install json-repair to install
 ### Features
 
 - **Ultra-low cost**: With DeepSeek V4 Flash, translating ~75,000 dialogue entries costs approximately **$2.39 USD**
@@ -39,7 +37,7 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 | `batch_translate.py` | **Main controller** — interactive entry point |
 | `glossary.py` | Reads terminology Excel or auto-extracts glossary from target + outputs review file |
 | `tm_matcher.py` | Template matching (**not yet enabled**, will be added in the official release) |
-| `llm_translator.py` | **AI batch translation core**, async parallel calls |
+| `llm_translator.py` | **AI batch translation core**, async parallel calls, with smart JSON extraction and json_repair fallback |
 | enforcer.py | **Three-layer enforcement** (terminology/placeholders/untranslated), auto-correction + color-coded review report |
 | `api_config.py` | Multi-API configuration parser, supports main/fallback classification, category-level default concurrency, per-API overrides |
 | `.env` | API configuration file, supports multi-API numbered format and legacy single-API format |
@@ -61,7 +59,7 @@ batch_translate.py → executes in order:
 ## Installation
 
 ```bash
-pip install openpyxl pandas openai python-dotenv
+pip install openpyxl pandas openai python-dotenv json-repair
 ```
 
 ## Configuration
@@ -70,11 +68,12 @@ pip install openpyxl pandas openai python-dotenv
 
 This tool supports any **OpenAI-compatible API**. Recommended options:
 
-| Platform | Recommended Model | Cost |
-|-----------------------------------------------|---------------------------------|----|
-| [OpenRouter](https://openrouter.ai/) | `deepseek/deepseek-v4-flash` | Very low |
+| Platform                                            | Recommended Model | Cost |
+|-----------------------------------------------------|---------------------------------|----|
+| [OpenRouter](https://openrouter.ai/)                | `deepseek/deepseek-v4-flash` | Very low |
 | [DeepSeek Official](https://platform.deepseek.com/) | `deepseek-v4-flash` | Very low |
-| [Nvidia (Free API)](https://build.nvidia.com/) | `deepseek-ai/deepseek-v4-flash` | Free |
+| [Nvidia (Free API)](https://build.nvidia.com/)      | `deepseek-ai/deepseek-v4-flash` | Free |
+| [Opencode Zen (Free API)](https://opencode.ai/zen/)     | `deepseek-v4-flash-free` | Free |
 
 ### 2. Create the `.env` File
 
@@ -255,13 +254,13 @@ The following constants are located in `api_config.py` and `llm_translator.py`. 
 | 5,000 | 0.14 USD | 2084s, 1465s, 2170s |
 | 75,000 | 2.39 USD | 8 hours |
 
-### Benchmarks (DeepSeek V4 Flash, Paid vs Free API Speed Comparison)
+### Benchmarks (Paid vs Free API Speed Comparison)
 
-Using paid API as the baseline (1x), the following shows the relative time required for a free API to translate a single batch (100 entries). If you have additional benchmark data, contributions are welcome.
+Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the relative time required for a free API to translate a single batch (100 entries). If you have additional benchmark data, contributions are welcome.
 
-| API Source | Nvidia (Free) |
-|----------|:-------------:|
-| Relative Time |     1-5x      |
+| API Source | Nvidia (DS v4 flash) | Opencode (DS v4 flash) | Openrouter (gpt-oss-120b) |
+|----------|:-------------------:|:--------------------:|:------------------------:|
+| Relative Time |       1-1.5x        |        1-1.5x        |         1.5-2x           |
 
 > 💡 **Usage tip**: Free APIs are considerably slower and are only recommended as a supplement to paid APIs for large-scale translations (e.g., 2,000+ entries). Since the multi-API round-robin dispatcher automatically distributes tasks to all available APIs, using free APIs for small batches (e.g., 500 entries) may proportionally slow down overall progress.
 
@@ -321,6 +320,16 @@ Using paid API as the baseline (1x), the following shows the relative time requi
 **Q: The target Excel has been modified since the last run — can I still resume?**
 <br>A: Resume relies on recorded selected indices (`selected_indices`). If the target Excel's content or entry order has changed, the indices may no longer match. It's recommended to choose "No" and start a fresh translation.
 
+### Debug Related
+
+**Q: The message `[APIx] ⚠️ Low translation rate 1.1% (1/94), debug info saved` appears**
+<br>A: The API lacks sufficient translation capability — only 1 out of 94 entries was successfully translated. Check the debug files in `workplace/_debugmessage/` to review the full response and consider switching to a different model.
+
+**Q: The message `[APIx] ⚠️ API returned a single object instead of an array` appears**
+<br>A: The API does not support batch responses, returning only a single item. If this message appears repeatedly, consider removing it from `.env` or switching to another
+
+**Q: The message `JSON repair successful` appears**
+<br>A: The model's response contained minor JSON formatting issues (e.g., missing commas or colons). `json_repair` has automatically fixed them — no impact on translation results.
 ---
 
 ## License
