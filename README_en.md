@@ -12,14 +12,15 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 19/6/2026, see [Changelog](Changelog.md) for details
-- Enhanced debug output: API errors, JSON parse failures, and low translation rates now show detailed diagnostics instead of being silently ignored
-- Added smart JSON extraction: tries known key names first, then auto-searches nested structures for arrays containing index+translation fields
-- Added API compatibility detection: alerts when an API returns single objects instead of arrays, recommending replacement
-- Added low-rate debug logging: saves full API response to workplace/_debugmessage/ when translation rate is below 25% for direct inspection
-- Added JSON repair: uses json_repair to fix malformed JSON responses (missing commas/colons, etc.), reducing retries
-- Improved API compatibility: unified handling of format differences across Nvidia, opencode, OpenRouter, and other providers
-- New dependency: json-repair — run pip install json-repair to install
+## Latest Update on 20/6/2026, see [Changelog](Changelog.md) for details
+- Fixed multi-sheet translation: originally designed but had multiple bugs (range selection, output, resume), now fully resolved
+  - Select all sheets at once, customize range per sheet, confirm once
+  - Output _translated_output.xlsx and review_report.xlsx after all sheets complete
+- Upgraded checkpoint resume for multi-sheet: each sheet gets its own checkpoint directory (_checkpoint/{sheet_name}/), resuming automatically continues with incomplete sheets while preserving completed ones
+- Added enforce checkpoint resume: if the retranslation phase (enforce) is interrupted, re-running will continue from the interrupted round without wasting API calls
+- save_session() now uses atomic write (.tmp → rename) to prevent session.json corruption on interrupt
+- Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
+
 ### Features
 
 - **Ultra-low cost**: With DeepSeek V4 Flash, translating ~75,000 dialogue entries costs approximately **$2.39 USD**
@@ -45,7 +46,7 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 | `workplace/` | **Working directory** (auto-created), all inputs and outputs stored here |
 
 > The `workplace/` directory contains the following subdirectories:
-> - `_checkpoint/` — Checkpoint data for resume (auto-deleted after completion)
+> - `_checkpoint/` — Checkpoint data for resume, each sheet has its own subdirectory (`{sheet_name}/`), auto-deleted after completion
 > - `_debugmessage/` — Low translation rate debug logs (auto-generated, displayed and cleared on next startup)
 
 ### Four-Stage Pipeline
@@ -55,7 +56,7 @@ batch_translate.py → executes in order:
 ① glossary.py      Load terminology database
 ② tm_matcher.py    Template parameter matching ⚠️ Not yet enabled, will be added in official release
 ③ llm_translator.py AI batch translation (async parallel)
-④ enforcer.py      Three-layer enforcement (terminology/placeholders/untranslated) + color-coded review report
+④ enforcer.py      Three-layer enforcement + retranslation + checkpoint resume + color-coded review report
 ```
 
 ---
@@ -317,6 +318,9 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 
 **Q: Progress is not detected when resuming**
 <br>A: Resume depends on `workplace/_checkpoint/session.json`. If you manually moved files, you need to move the entire `_checkpoint/` directory together. If `session.json` was manually deleted, the resume feature will not work.
+
+**Q: Translations from a completed sheet are missing after resume**
+<br>A: Resume automatically restores data from completed sheets. If the interruption occurred during translation, simply re-run the script to continue from the interrupted sheet.
 
 **Q: Some translations are missing after resuming**
 <br>A: As noted in the "Checkpoint Resume" section, in extreme cases (such as abrupt shutdown) the last 1-2 batches may not be saved. This is normal — simply re-translate the missing entries.

@@ -93,6 +93,10 @@ def load_api_configs() -> list[ApiConfig]:
             continue
 
         base_url = os.getenv(f"{prefix}BASE_URL", "").strip()
+        if not base_url:
+            print(f"  警告：API{idx} 缺少 BASE_URL，跳過")
+            idx += 1
+            continue
         model_provider = os.getenv(f"{prefix}MODEL_PROVIDER", "").strip()
 
         # 解析並發上限：獨立值 > 類別預設

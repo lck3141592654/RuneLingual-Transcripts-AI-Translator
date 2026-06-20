@@ -69,17 +69,23 @@ def get_relevant_glossary(batch, glossary):
             covered_spans.extend(spans)
     return relevant
 
+def _sanitize_sheet_name(name: str) -> str:
+    """將工作表名稱轉換為安全的目錄名稱。"""
+    return re.sub(r'[<>:"/\\|?*]', '_', name)
 
-def _checkpoint_dir(output_dir=None) -> Path:
+def _checkpoint_dir(output_dir=None, sheet_name=None) -> Path:
     if output_dir:
-        return Path(output_dir) / CHECKPOINT_SUBDIR
-    return Path(__file__).parent / CHECKPOINT_SUBDIR
-
+        base = Path(output_dir) / CHECKPOINT_SUBDIR
+    else:
+        base = Path(__file__).parent / CHECKPOINT_SUBDIR
+    if sheet_name:
+        base = base / _sanitize_sheet_name(sheet_name)
+    return base
 
 # ── 進度檔案 ──
 
-def load_progress(output_dir=None) -> dict:
-    p = _checkpoint_dir(output_dir) / PROGRESS_FILE
+def load_progress(output_dir=None, sheet_name=None) -> dict:
+    p = _checkpoint_dir(output_dir, sheet_name) / PROGRESS_FILE
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
@@ -88,8 +94,8 @@ def load_progress(output_dir=None) -> dict:
     return {"completed_count": 0, "completed_indices": []}
 
 
-def save_progress(output_dir, completed_indices: list):
-    cd = _checkpoint_dir(output_dir)
+def save_progress(output_dir, completed_indices: list, sheet_name=None):
+    cd = _checkpoint_dir(output_dir, sheet_name)
     cd.mkdir(parents=True, exist_ok=True)
     data = {
         "completed_count": len(completed_indices),
@@ -105,8 +111,13 @@ def save_progress(output_dir, completed_indices: list):
 def save_session(output_dir, session_info: dict):
     cd = _checkpoint_dir(output_dir)
     cd.mkdir(parents=True, exist_ok=True)
-    sf = cd / SESSION_FILE
-    sf.write_text(json.dumps(session_info, ensure_ascii=False, indent=2), encoding="utf-8")
+    import os as _os
+    tmp = cd / f"{SESSION_FILE}.tmp"
+    final = cd / SESSION_FILE
+    tmp.write_text(json.dumps(session_info, ensure_ascii=False, indent=2), encoding="utf-8")
+    with open(tmp, 'ab') as f:
+        _os.fsync(f.fileno())
+    tmp.replace(final)
 
 
 def load_session(output_dir=None) -> dict | None:
@@ -121,9 +132,9 @@ def load_session(output_dir=None) -> dict | None:
 
 # ── 備份：每批次獨立一個 part 檔案（UUID 避免覆蓋） ──
 
-def save_backup_part(output_dir, session_tag: str, batch_num: int, batch_data: dict):
+def save_backup_part(output_dir, session_tag: str, batch_num: int, batch_data: dict, sheet_name=None):
     """原子寫入單一批次的 part 檔案（強制同步磁碟後才 rename）"""
-    cd = _checkpoint_dir(output_dir)
+    cd = _checkpoint_dir(output_dir, sheet_name)
     cd.mkdir(parents=True, exist_ok=True)
     import os as _os
     tmp = cd / f"part_{session_tag}_{batch_num:06d}.tmp"
@@ -134,9 +145,9 @@ def save_backup_part(output_dir, session_tag: str, batch_num: int, batch_data: d
     tmp.replace(final)
 
 
-def load_backup(output_dir=None) -> dict:
+def load_backup(output_dir=None, sheet_name=None) -> dict:
     """掃描所有 part_*.json，以 idx 為鍵合併所有備份資料"""
-    cd = _checkpoint_dir(output_dir)
+    cd = _checkpoint_dir(output_dir, sheet_name)
     if not cd.exists():
         return {}
     all_backup: dict = {}
@@ -148,21 +159,20 @@ def load_backup(output_dir=None) -> dict:
             pass
     return all_backup
 
-
-def sync_progress(output_dir=None):
+def sync_progress(output_dir=None, sheet_name=None):
     """從 backup part 檔案反推 progress.json，確保絕對同步"""
-    backup = load_backup(output_dir)
+    backup = load_backup(output_dir, sheet_name)
     indices = sorted(int(k) for k in backup)
     if indices:
-        save_progress(output_dir, indices)
+        save_progress(output_dir, indices, sheet_name)
     else:
-        pp = _checkpoint_dir(output_dir) / PROGRESS_FILE
+        pp = _checkpoint_dir(output_dir, sheet_name) / PROGRESS_FILE
         if pp.exists():
             pp.unlink()
 
-def delete_checkpoint_files(output_dir):
+def delete_checkpoint_files(output_dir, sheet_name=None):
     """清除所有 checkpoint 檔案"""
-    cd = _checkpoint_dir(output_dir)
+    cd = _checkpoint_dir(output_dir, sheet_name)
     if cd.exists():
         import shutil
         shutil.rmtree(cd)
@@ -228,11 +238,17 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                                     break
                 if found is not None:
                     results = found
-            # ：如果 dict 本身就有 index+translation，視為單一條目
+            # ：如果 dict 本身就有 index+translation，視為單一條目 → 拋出例外觸發重試
             if isinstance(results, dict) and "index" in results and "translation" in results:
-                results = [results]
-                print(f"    [{api_id}] ⚠️ API 回傳單一物件而非陣列")
+                print(f"    [{api_id}] ⚠️ API 回傳單一物件而非陣列（嘗試 {attempt + 1}/3）")
                 print(f"    [{api_id}] ⚠️ 如果多次顯示此訊息，代表此 API 不適合翻譯任務，建議從 .env 移除或更換模型")
+                if attempt < 2:
+                    print(f"    [{api_id}] 準備重試...")
+                    raise ValueError("single object returned, need array")
+                else:
+                    results = [results]
+                    print(f"    [{api_id}] 3 次嘗試均回傳單一物件，強制使用")
+                    print(f"    [{api_id}] ⚠️ 如果多次顯示此訊息，代表此 API 不適合翻譯任務，建議從 .env 移除或更換模型")
             if isinstance(results, list) and len(results) > 0:
                 success = sum(1 for r in results if isinstance(r, dict) and r.get("translation"))
                 rate = success / len(batch) if len(batch) > 0 else 0
@@ -282,8 +298,12 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                         print(f"    [{api_id}] ⚠️ JSON 修復成功")
                         if isinstance(results, list):
                             return results
-                        if isinstance(results, dict) and "translations" in results:
-                            return results["translations"]
+                        if isinstance(results, dict):
+                            if "translations" in results:
+                                return results["translations"]
+                            # 修復後是單一物件 → 照一般流程處理
+                            if "index" in results and "translation" in results:
+                                raise ValueError("single object after repair, need array")
                 except Exception:
                     pass
             # ↑ 修復結束
@@ -295,7 +315,7 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
 
 
 # ── 非同步翻譯核心（多 API 共享隊列） ──
-async def _translate_all_async(df, glossary, output_dir, pending):
+async def _translate_all_async(df, glossary, output_dir, pending, sheet_name=None):
     api_configs = load_api_configs()
     if not api_configs:
         print("  錯誤：沒有可用的 API 設定")
@@ -358,8 +378,8 @@ async def _translate_all_async(df, glossary, output_dir, pending):
                         df.at[idx, "translation"] = trans
                         new_backup[str(idx)] = str(trans)
                 if new_backup:
-                    save_backup_part(output_dir, session_tag, batch_num, new_backup)
-                    sync_progress(output_dir)
+                    save_backup_part(output_dir, session_tag, batch_num, new_backup, sheet_name)
+                    sync_progress(output_dir, sheet_name)
                 _timestamp(f"批次 {batch_num}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
             except Exception as e:
                 error_str = str(e).lower()
@@ -399,6 +419,14 @@ async def _translate_all_async(df, glossary, output_dir, pending):
             available.append(ws)
 
         if not available or queue.empty():
+            # 檢查是否所有 API 都已永久停用
+            all_disabled = all(
+                ws["cfg"].is_permanently_disabled for ws in worker_states
+            )
+            if all_disabled and not queue.empty():
+                print(f"\n  ⚠️ 所有 API 已永久停用（兩次 429 限流），無法繼續翻譯")
+                print(f"  已儲存部分翻譯進度，請檢查 API Key 後重新執行即可續傳")
+                raise RuntimeError("all APIs permanently disabled")
             await asyncio.sleep(0.2)
             continue
 
@@ -421,11 +449,11 @@ async def _translate_all_async(df, glossary, output_dir, pending):
         try:
             await asyncio.gather(*all_tasks)
         except (asyncio.CancelledError, KeyboardInterrupt):
-            sync_progress(output_dir)
+            sync_progress(output_dir, sheet_name)
             print(f"\n  ⚠️ 檢測到中斷，已儲存翻譯備份")
             raise
 
-    sync_progress(output_dir)
+    sync_progress(output_dir, sheet_name)
     _timestamp("翻译完成")
     return df
 
@@ -476,11 +504,12 @@ def _group_into_batches(pending):
     return batches
 
 
-def translate_all(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = None) -> pd.DataFrame:
+def translate_all(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = None,
+                  sheet_name: str | None = None) -> pd.DataFrame:
     df = df.copy()
 
     # ── 從備份還原已翻譯的內容 ──
-    backup = load_backup(output_dir)
+    backup = load_backup(output_dir, sheet_name)
     if backup:
         restore_count = 0
         for idx_str, trans in backup.items():
@@ -511,5 +540,5 @@ def translate_all(df: pd.DataFrame, glossary: dict, output_dir: str | Path | Non
     total = len(pending)
     print(f"  待翻译: {total} 条")
 
-    df = asyncio.run(_translate_all_async(df, glossary, output_dir, pending))
+    df = asyncio.run(_translate_all_async(df, glossary, output_dir, pending, sheet_name))
     return df

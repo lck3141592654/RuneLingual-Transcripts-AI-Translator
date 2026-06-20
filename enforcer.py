@@ -177,14 +177,34 @@ async def _retry_round(client, model_name, pool, glossary_text, rnd):
                                for idx, _, _ in batch])
     return all_results
 
-async def _enforce_async(df, relevant_glossary, glossary_text):
-    """非同步執行重譯循環，使用多 API 共享隊列模式"""
+async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, sheet_name=None):
+    """非同步執行重譯循環，使用多 API 共享隊列模式（支援續傳）"""
+    from llm_translator import save_backup_part, _sanitize_sheet_name
+    import uuid
     api_configs = load_api_configs()
     if not api_configs:
         print("  無可用 API，跳過重譯")
         return df
 
-    for rnd in range(3):
+    # ── 檢查 enforce checkpoint ──
+    start_round = 0
+    enforce_tag = uuid.uuid4().hex[:8]
+    cp_dir = None
+    cp_file = None
+    if output_dir and sheet_name:
+        cp_dir = Path(output_dir) / "_checkpoint" / _sanitize_sheet_name(sheet_name)
+        cp_file = cp_dir / "enforce_checkpoint.json"
+        if cp_file.exists():
+            try:
+                cp_data = json.loads(cp_file.read_text(encoding="utf-8"))
+                start_round = cp_data.get("completed_rounds", 0)
+                # 從 checkpoint 載入之前生成的 enforce_tag，若無則用新的
+                enforce_tag = cp_data.get("enforce_tag", enforce_tag)
+                print(f"  偵測到重譯進度，從第 {start_round + 1} 輪開始")
+            except Exception:
+                pass
+
+    for rnd in range(start_round, 3):
         pool = scan_issues(df, relevant_glossary)
 
         if not pool:
@@ -274,6 +294,30 @@ async def _enforce_async(df, relevant_glossary, glossary_text):
         # 計算修正率，決定是否繼續
         post_pool = scan_issues(df, relevant_glossary)
 
+        # ★ 儲存本輪修正到 part 檔案（原子寫入） ★
+        if output_dir:
+            backup_data = {}
+            for idx, row, _ in pool:
+                trans = df.at[idx, "translation"]
+                if trans is not None:
+                    backup_data[str(idx)] = str(trans)
+            if backup_data:
+                save_backup_part(output_dir, enforce_tag, rnd + 1, backup_data, sheet_name)
+
+        # ★ 儲存 enforce checkpoint ★
+        if cp_file:
+            cp_file.parent.mkdir(parents=True, exist_ok=True)
+            import os as _os
+            tmp = cp_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "completed_rounds": rnd + 1,
+                "enforce_tag": enforce_tag,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            with open(tmp, 'ab') as f:
+                _os.fsync(f.fileno())
+            tmp.replace(cp_file)
+
         post_count = len(post_pool)
         if post_count == 0:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -289,10 +333,16 @@ async def _enforce_async(df, relevant_glossary, glossary_text):
             print(f"  [{now}] 修正率低於 5%，跳過後續輪次")
             break
 
+    # ── 所有輪次完成，刪除 enforce checkpoint ──
+    if cp_file and cp_file.exists():
+        cp_file.unlink()
+        print("  重譯完成，已清除進度記錄")
+
     return df
 
-
-def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = None) -> tuple:
+def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = None,
+            report_name: str = "review_report.xlsx", write_report: bool = True,
+            sheet_name: str | None = None) -> tuple:
     df = df.copy()
     review_rows = []
 
@@ -309,7 +359,7 @@ def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = No
 
     # 非同步重譯
     if api_configs:
-        df = asyncio.run(_enforce_async(df, relevant_glossary, glossary_text))
+        df = asyncio.run(_enforce_async(df, relevant_glossary, glossary_text, output_dir, sheet_name))
 
     # 最終審查掃描
     final_pool = scan_issues(df, relevant_glossary)
@@ -325,8 +375,8 @@ def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = No
             })
 
     review_df = pd.DataFrame(review_rows)
-    if not review_df.empty:
-        fp = Path(output_dir) / "review_report.xlsx" if output_dir else Path(__file__).parent / "review_report.xlsx"
+    if write_report and not review_df.empty:
+        fp = Path(output_dir) / report_name if output_dir else Path(__file__).parent / report_name
 
         from openpyxl.styles import PatternFill
 

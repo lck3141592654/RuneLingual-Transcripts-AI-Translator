@@ -18,6 +18,7 @@ ADD_LIST: dict[str, str] = {
     "Armadyl": "阿玛杜尔", "Bandos": "班多斯", "Zaros": "扎罗斯", "Tumeken": "图梅肯",
     "Elidinis": "伊莉迪尼斯", "Jas": "贾斯", "Marimbo": "马里姆博", "Ralos": "拉洛斯",
     "Ranul": "拉努尔", "Kayzertief": "凯泽提夫", "Xeric": "泽里克", "Xerician": "泽里克西亚",
+    "Iknami": "朋友", "Kuani": "太好了", "Nilsal": "你好", "Timoiva": "再见",
 }
 
 IGNORE_LIST: set[str] = set()
@@ -81,7 +82,8 @@ IGNORE_LIST: set[str] = {"Toolkit", "Vial", "Bones", "Burnt bones", "Cup of tea"
                          , "Floor", "Dishes", "Orange", "Table", "Grave"
                          , "Nick", "A corpse", "Spirit", "Flames", "Shark"
                          , "Cages", "Wood", "Frame", "Heat", "Pots"
-                         , "Green", "Wool", "Hammer", "Standard", "Box"}
+                         , "Green", "Wool", "Hammer", "Standard", "Box"
+                         , "Bricks", "Wool", "Hammer", "Standard", "Box"}
 
 def normalize_term(term: str) -> str:
     """將術語歸一化，使 IGNORE_LIST 能同時匹配單數和複數型"""

@@ -12,14 +12,14 @@
 
 > ⚠️ **測試版公告**：本工具目前為測試階段，暫時只支援**簡體中文**翻譯。其他語言將在正式版中支援。
 
-## 最近更新 (19/6/2026)，更新詳情請看 [Changelog](Changelog.md)
-- 強化除錯訊息：API 錯誤、JSON 解析失敗、低翻譯率均顯示具體原因，不再靜默吞掉
-- 新增智慧 JSON 提取：依序嘗試已知 key 名稱，未命中時自動搜尋巢狀結構中含 index+translation 的陣列
-- 新增 API 適用性檢測：單一物件回傳時提示該 API 不適合翻譯任務，建議更換
-- 新增低翻譯率 debug 記錄：翻譯率低於 25% 時將完整回傳內容儲存至 workplace/_debugmessage/
-- 新增 JSON 修復機制：引入 json_repair 自動修復格式不完整的 JSON 回傳（缺少逗號/冒號等），減少重試次數
-- 改善 API 兼容性：Nvidia、opencode、OpenRouter 等多種格式差異現已統一處理
-- 新增依賴項：json-repair，執行 pip install json-repair 安裝
+## 最近更新 (20/6/2026)，更新詳情請看 [Changelog](Changelog.md)
+- 修正多工作表翻譯：原始設計已支援，但存在多項 BUG（範圍選擇/輸出/續傳），現已全面修復
+  - 一次性選取所有工作表，逐表自訂翻譯範圍，無需逐表重複確認
+  - 全部完成後才輸出 _translated_output.xlsx 與 review_report.xlsx
+- 斷點續傳全面升級支援多工作表：各工作表擁有獨立檢查點目錄（_checkpoint/{sheet_name}/），中斷後續傳時自動接續未完成的工作表，保留已完成的工作表資料
+- 新增重譯中斷續傳：重譯過程（術語強制後處理）若中斷，重新執行後會從中斷的輪次繼續，不浪費 API 調用
+- save_session() 改為原子寫入（.tmp → rename），避免中斷導致 session.json 損毀
+- 擴充內建術語庫（ADD_LIST）與排除清單（IGNORE_LIST）條目
 
 ### 特色
 
@@ -46,7 +46,7 @@
 | `workplace/` | **工作目錄**（腳本自動建立），所有輸入輸出統一存放於此  |
 
 > `workplace/` 目錄包含以下子目錄：
-> - `_checkpoint/` — 中斷續傳暫存（翻譯完成後自動刪除）
+> - `_checkpoint/` — 中斷續傳暫存，各工作表擁有獨立子目錄（`{sheet_name}/`），翻譯完成後自動刪除
 > - `_debugmessage/` — 低翻譯率 debug 記錄（自動產生，下次啟動時顯示後清除）
 
 ### 四階段流程
@@ -56,7 +56,7 @@ batch_translate.py → 依序執行：
 ① glossary.py      載入術語庫
 ② tm_matcher.py    模板參數比對 ⚠️ 尚未啟用，將在正式版加入
 ③ llm_translator.py AI 批次翻譯（非同步並行）
-④ enforcer.py      三層強制檢查（術語/佔位符/未翻譯）+ 彩色審查報告
+④ enforcer.py      三層強制檢查 + 重譯 + 中斷續傳 + 彩色審查報告
 ```
 
 ---
@@ -316,6 +316,9 @@ IGNORE_LIST: set[str] = {
 
 **Q：續傳時偵測不到進度**
 <br>A：續傳依賴 `workplace/_checkpoint/session.json`。如果你手動搬移檔案，需要將整個 `_checkpoint/` 目錄一併移動。如果手動刪除了 `session.json`，續傳功能將無法使用。
+
+**Q：續傳時某個工作表的翻譯遺失**
+<br>A：續傳會自動還原已完成工作表的資料。若中斷發生在翻譯過程中，重新執行腳本即可從中斷的工作表繼續。
 
 **Q：續傳後部分翻譯遺失**
 <br>A：如「中斷續傳」章節所述，極端情況下（如突然關機）最近 1-2 批翻譯可能無法保存。這是正常現象，重新翻譯遺失的部分即可。

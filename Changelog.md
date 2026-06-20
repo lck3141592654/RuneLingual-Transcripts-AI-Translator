@@ -1,6 +1,6 @@
 # Changelog
 
-## 18/6/2026 更新 / 18/6/2026 Update
+## 18/6/2026 v0.1 -> v0.2
 
 ### 中文
 - 新增多 API Key 並行作業，自動輪流分配任務並處理 429 限流
@@ -22,7 +22,7 @@
 - Enhanced interactive UI: per-batch API indicators, detailed retranslation stats, and comprehensive stage timestamps
 - Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
 
-## 19/6/2026 更新 / 19/6/2026 Update
+## 19/6/2026 v0.2 -> v0.2.1
 
 ### 中文
 - 強化除錯訊息：API 錯誤、JSON 解析失敗、低翻譯率均顯示具體原因，不再靜默吞掉
@@ -41,3 +41,23 @@
 - Added JSON repair: uses json_repair to fix malformed JSON responses (missing commas/colons, etc.), reducing retries
 - Improved API compatibility: unified handling of format differences across Nvidia, opencode, OpenRouter, and other providers
 - New dependency: json-repair — run pip install json-repair to install
+
+## 20/6/2026 v0.21 -> v0.2.2
+
+### 中文
+- 修正多工作表翻譯：原始設計已支援，但存在多項 BUG（範圍選擇/輸出/續傳），現已全面修復
+  - 一次性選取所有工作表，逐表自訂翻譯範圍，無需逐表重複確認
+  - 全部完成後才輸出 _translated_output.xlsx 與 review_report.xlsx
+- 斷點續傳全面升級支援多工作表：各工作表擁有獨立檢查點目錄（_checkpoint/{sheet_name}/），中斷後續傳時自動接續未完成的工作表，保留已完成的工作表資料
+- 新增重譯中斷續傳：重譯過程（術語強制後處理）若中斷，重新執行後會從中斷的輪次繼續，不浪費 API 調用
+- save_session() 改為原子寫入（.tmp → rename），避免中斷導致 session.json 損毀
+- 擴充內建術語庫（ADD_LIST）與排除清單（IGNORE_LIST）條目
+
+### English
+- Fixed multi-sheet translation: originally designed but had multiple bugs (range selection, output, resume), now fully resolved
+  - Select all sheets at once, customize range per sheet, confirm once
+  - Output _translated_output.xlsx and review_report.xlsx after all sheets complete
+- Upgraded checkpoint resume for multi-sheet: each sheet gets its own checkpoint directory (_checkpoint/{sheet_name}/), resuming automatically continues with incomplete sheets while preserving completed ones
+- Added enforce checkpoint resume: if the retranslation phase (enforce) is interrupted, re-running will continue from the interrupted round without wasting API calls
+- save_session() now uses atomic write (.tmp → rename) to prevent session.json corruption on interrupt
+- Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
