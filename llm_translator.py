@@ -5,7 +5,7 @@ from openai import AsyncOpenAI
 import pandas as pd
 from dotenv import load_dotenv
 from glossary import normalize_term
-from api_config import load_api_configs, REQUEST_INTERVAL
+from api_config import load_api_configs, ApiConfig, REQUEST_INTERVAL
 
 load_dotenv()
 
@@ -33,7 +33,7 @@ SYSTEM_PROMPT_BASE = (
     "6. 每条翻译独立进行，不要合并或省略\n"
     "7. 如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式。"
     "你必須使用'.'分隔，不要自行改為'·'或其他方式。你必須使用'.'分隔，不要自行改為'·'或其他方式。\n"
-    "8. 输出格式为 JSON 阵列，每条物件包含 "
+    "8. 输出格式为原始 JSON 阵列（不要使用 ```json 代码块包裹），每条物件包含 "
     "\"index\" 和 \"translation\" 两个栏位\n"
     "9. 如有 notes、wiki_url 等原始栏位，一并保留在输出物件中\n\n"
     "## 强制术语表（禁止使用官方和社区通常的翻譯，遇到以下英文词必须使用指定的中文翻译）\n"
@@ -178,6 +178,90 @@ def delete_checkpoint_files(output_dir, sheet_name=None):
         shutil.rmtree(cd)
 
 
+# ── 通用 async worker pool ──
+
+async def run_worker_pool(
+    api_configs: list[ApiConfig],
+    batches: list[list[dict]],
+    process_func,
+) -> None:
+    """
+    通用 async worker pool，供翻譯/校對共用。
+
+    process_func(ws, batch_num, batch, retry_queue) -> None
+      - ws = {"cfg", "client", "sem", "rate_lock", "last_request", "active_count"}
+      - 正常完成時直接 return
+      - 429 時呼叫 retry_queue.put_nowait((batch_num, batch)) 放回重試
+
+    不需 checkpoint 參數，由 process_func 自行決定備份策略。
+    """
+    active_configs = [cfg for cfg in api_configs if not cfg.is_permanently_disabled]
+    if not active_configs:
+        print("  錯誤：所有 API 已永久停用")
+        return
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for bi, batch in enumerate(batches):
+        queue.put_nowait((bi + 1, batch))
+
+    worker_states = []
+    for cfg in active_configs:
+        worker_states.append({
+            "cfg": cfg,
+            "client": AsyncOpenAI(api_key=cfg.key, base_url=cfg.base_url),
+            "sem": asyncio.Semaphore(cfg.parallel_limit),
+            "rate_lock": asyncio.Lock(),
+            "last_request": 0.0,
+            "active_count": 0,
+        })
+
+    all_tasks = []
+    round_robin_index = 0
+
+    while True:
+        all_tasks = [t for t in all_tasks if not t.done()]
+
+        if queue.empty() and all(ws["active_count"] == 0 for ws in worker_states):
+            break
+
+        available = []
+        for ws in worker_states:
+            cfg = ws["cfg"]
+            if cfg.is_cooling_down or cfg.is_permanently_disabled:
+                continue
+            if ws["active_count"] >= cfg.parallel_limit:
+                continue
+            available.append(ws)
+
+        if not available or queue.empty():
+            all_disabled = all(
+                ws["cfg"].is_permanently_disabled for ws in worker_states
+            )
+            if all_disabled and not queue.empty():
+                print(f"\n  ⚠️ 所有 API 已永久停用（兩次 429 限流），無法繼續翻譯")
+                print(f"  已儲存部分翻譯進度，請檢查 API Key 後重新執行即可續傳")
+                raise RuntimeError("all APIs permanently disabled")
+            await asyncio.sleep(0.2)
+            continue
+
+        for _ in range(len(available)):
+            ws = available[round_robin_index % len(available)]
+            round_robin_index = (round_robin_index + 1) % len(available)
+            try:
+                batch_num, batch = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            ws["active_count"] += 1
+            task = asyncio.create_task(process_func(ws, batch_num, batch, queue))
+            all_tasks.append(task)
+
+    if all_tasks:
+        try:
+            await asyncio.gather(*all_tasks)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            raise
+
 # ── LLM API 調用 ──
 
 async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
@@ -200,7 +284,7 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
-                response_format={"type": "json_object"},
+
                 temperature=0.1,
                 timeout=3600,
             )
@@ -321,7 +405,6 @@ async def _translate_all_async(df, glossary, output_dir, pending, sheet_name=Non
         print("  錯誤：沒有可用的 API 設定")
         return df
 
-    # 過濾掉已永久停用的 API（若從 checkpoint 恢復時可能殘留）
     active_configs = [cfg for cfg in api_configs if not cfg.is_permanently_disabled]
     if not active_configs:
         print("  錯誤：所有 API 已永久停用")
@@ -331,32 +414,11 @@ async def _translate_all_async(df, glossary, output_dir, pending, sheet_name=Non
     for cfg in active_configs:
         print(f"    {cfg.api_id} {cfg.model_provider}/{cfg.model} ({cfg.api_type}, 並發={cfg.parallel_limit})")
 
-    # ── 分組 ──
     batches = _group_into_batches(pending)
     total_batches = len(batches)
-
-    # ── 共享隊列 ──
-    queue: asyncio.Queue = asyncio.Queue()
-    for bi, batch in enumerate(batches):
-        queue.put_nowait((bi + 1, batch))
-
-    # ── 生成 session_tag ──
     session_tag = uuid.uuid4().hex[:8]
 
-    # ── 每個 Worker 的狀態 ──
-    worker_states = []
-    for cfg in active_configs:
-        worker_states.append({
-            "cfg": cfg,
-            "client": AsyncOpenAI(api_key=cfg.key, base_url=cfg.base_url),
-            "sem": asyncio.Semaphore(cfg.parallel_limit),
-            "rate_lock": asyncio.Lock(),
-            "last_request": 0.0,
-            "active_count": 0,
-        })
-
-    # ── 單一批次處理函數 ──
-    async def process_batch(ws, batch_num, batch):
+    async def _process_batch(ws, batch_num, batch, retry_queue):
         cfg = ws["cfg"]
         async with ws["rate_lock"]:
             now = time.monotonic()
@@ -389,69 +451,18 @@ async def _translate_all_async(df, glossary, output_dir, pending, sheet_name=Non
                         print(f"  [{cfg.api_id} {cfg.model}] 第二次 429，永久停用")
                     else:
                         print(f"  [{cfg.api_id} {cfg.model}] 429，冷卻 60 秒")
-                    # 放回隊列
-                    queue.put_nowait((batch_num, batch))
+                    retry_queue.put_nowait((batch_num, batch))
                 else:
                     print(f"  [{cfg.api_id} {cfg.model}] 錯誤：{e}")
             finally:
                 ws["active_count"] -= 1
 
-    # ── 中央調度器：持續輪詢分配 ──
-    all_tasks = []
-    round_robin_index = 0
-
-    while True:
-        # 清理已完成的 task
-        all_tasks = [t for t in all_tasks if not t.done()]
-
-        # 檢查隊列是否空 + 無活躍任務
-        if queue.empty() and all(ws["active_count"] == 0 for ws in worker_states):
-            break
-
-        # 過濾可用 Worker（未冷卻、未永久停用、未滿）
-        available = []
-        for ws in worker_states:
-            cfg = ws["cfg"]
-            if cfg.is_cooling_down or cfg.is_permanently_disabled:
-                continue
-            if ws["active_count"] >= cfg.parallel_limit:
-                continue
-            available.append(ws)
-
-        if not available or queue.empty():
-            # 檢查是否所有 API 都已永久停用
-            all_disabled = all(
-                ws["cfg"].is_permanently_disabled for ws in worker_states
-            )
-            if all_disabled and not queue.empty():
-                print(f"\n  ⚠️ 所有 API 已永久停用（兩次 429 限流），無法繼續翻譯")
-                print(f"  已儲存部分翻譯進度，請檢查 API Key 後重新執行即可續傳")
-                raise RuntimeError("all APIs permanently disabled")
-            await asyncio.sleep(0.2)
-            continue
-
-        # 輪流分配
-        for _ in range(len(available)):
-            ws = available[round_robin_index % len(available)]
-            round_robin_index = (round_robin_index + 1) % len(available)
-
-            try:
-                batch_num, batch = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-            ws["active_count"] += 1
-            task = asyncio.create_task(process_batch(ws, batch_num, batch))
-            all_tasks.append(task)
-
-    # 等待所有 task 完成
-    if all_tasks:
-        try:
-            await asyncio.gather(*all_tasks)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            sync_progress(output_dir, sheet_name)
-            print(f"\n  ⚠️ 檢測到中斷，已儲存翻譯備份")
-            raise
+    try:
+        await run_worker_pool(active_configs, batches, _process_batch)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        sync_progress(output_dir, sheet_name)
+        print(f"\n  ⚠️ 檢測到中斷，已儲存翻譯備份")
+        raise
 
     sync_progress(output_dir, sheet_name)
     _timestamp("翻译完成")

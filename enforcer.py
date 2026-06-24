@@ -7,11 +7,12 @@ from datetime import datetime
 
 load_dotenv()
 
+from glossary import normalize_term
 from llm_translator import BATCH_SIZE_LIMIT
 from api_config import load_api_configs, REQUEST_INTERVAL
 
 RETRY_PROMPTS = [
-    "1. 如果译文中 [] 内的内容与原文不同，请恢复为原文的占位符。"
+    "1. 禁止翻譯 [] 内的内容，如果译文中 [] 内的内容与原文不同，必須恢复为原文的占位符。"
     "2. 如果当前译文与原文完全相同或沒有內容，请重新翻译。"
     "3. 使用简体中文修正以下翻译中的游戏术语错误。"
     "4. 如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式：",
@@ -30,11 +31,16 @@ def _find_matched_spans(eng_lower: str, glossary: dict) -> list:
     for eng, chn in glossary.items():
         pat_str = r"(?<![a-z'])" + re.escape(eng.lower()) + r"(?![a-z'])"
         spans = [m.span() for m in re.finditer(pat_str, eng_lower)]
+        norm = normalize_term(eng)
+        if norm != eng.lower():
+            norm_pat = r"(?<![a-z'])" + re.escape(norm) + r"(?![a-z'])"
+            spans.extend([m.span() for m in re.finditer(norm_pat, eng_lower)])
         if spans:
             matches.append((eng, chn, spans))
     # 長術語優先處理（避免短術語被長術語覆蓋時誤報）
     matches.sort(key=lambda x: len(x[0]), reverse=True)
     return matches
+
 
 
 def check_glossary_usage(english_text: str, translated_text: str, glossary: dict) -> list:

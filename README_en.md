@@ -12,13 +12,10 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 20/6/2026, see [Changelog](Changelog.md) for details
-- Fixed multi-sheet translation: originally designed but had multiple bugs (range selection, output, resume), now fully resolved
-  - Select all sheets at once, customize range per sheet, confirm once
-  - Output _translated_output.xlsx and review_report.xlsx after all sheets complete
-- Upgraded checkpoint resume for multi-sheet: each sheet gets its own checkpoint directory (_checkpoint/{sheet_name}/), resuming automatically continues with incomplete sheets while preserving completed ones
-- Added enforce checkpoint resume: if the retranslation phase (enforce) is interrupted, re-running will continue from the interrupted round without wasting API calls
-- save_session() now uses atomic write (.tmp → rename) to prevent session.json corruption on interrupt
+## Latest Update on 24/6/2026, see [Changelog](Changelog.md) for details
+- **New proofreading pipeline**: Added `proofreader.py` + `batch_proofread.py` with LLM dual-round evaluation, polishing, and retranslation protection
+- **Removed response_format**: All API calls (translation and proofreading) now use prompt to directly request raw JSON arrays for better compatibility
+- Shared `run_worker_pool()` and `get_relevant_glossary()` extracted to `llm_translator.py`, used by both translation and proofreading
 - Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
 
 ### Features
@@ -30,12 +27,16 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 - **Checkpoint resume**: If the translation is interrupted due to network issues or manual interruption (Ctrl+C), simply re-run the script to resume from where it left off — no need to start over
 - **Auto-review**: Three-layer checks (terminology / placeholders / untranslated), generates a color-coded review report
 - **Multi-API support**: Supports using multiple API keys simultaneously (main/fallback classification), round-robin task distribution, automatic 429 rate-limit handling (cooldown/permanent disable), maximizing translation throughput
+- **Automated proofreading workflow**: LLM dual-round evaluation cross-validation + up to 3 rounds of polishing + retranslation protection, produces color-coded proofreading reports
+- **Glossary-based proofreading**: Enforces glossary during proofreading to prevent the LLM from deviating from correct terminology when polishing
 
 ### File Structure
 
 | File | Purpose |
 |---|---------------------------------|
-| `batch_translate.py` | **Main controller** — interactive entry point |
+| `batch_translate.py` | **Main translation script** — interactive entry point |
+| `batch_proofread.py` | **Proofreading script** — interactive entry point |
+| `proofreader.py` | **Proofreading core module** — LLM dual-round evaluation + polishing + retranslation protection |
 | `glossary.py` | Reads terminology Excel or auto-extracts glossary from target + outputs review file |
 | `tm_matcher.py` | Template matching (**not yet enabled**, will be added in the official release) |
 | `llm_translator.py` | **AI batch translation core**, async parallel calls, with smart JSON extraction and json_repair fallback |
@@ -46,17 +47,30 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 | `workplace/` | **Working directory** (auto-created), all inputs and outputs stored here |
 
 > The `workplace/` directory contains the following subdirectories:
-> - `_checkpoint/` — Checkpoint data for resume, each sheet has its own subdirectory (`{sheet_name}/`), auto-deleted after completion
+> - `_checkpoint/` — Translation checkpoint data for resume, each sheet has its own subdirectory (`{sheet_name}/`), auto-deleted after completion
+> - `_proofread_checkpoint/` — Proofreading-specific checkpoint, independent from main translation
+> - `_proofread_backup/` — Proofreading backup
 > - `_debugmessage/` — Low translation rate debug logs (auto-generated, displayed and cleared on next startup)
 
-### Four-Stage Pipeline
+
+### Pipeline
 
 ```
+Main Translation Script
 batch_translate.py → executes in order:
 ① glossary.py      Load terminology database
 ② tm_matcher.py    Template parameter matching ⚠️ Not yet enabled, will be added in official release
 ③ llm_translator.py AI batch translation (async parallel)
 ④ enforcer.py      Three-layer enforcement + retranslation + checkpoint resume + color-coded review report
+```
+```
+Proofreading Script
+batch_proofread.py → processes each worksheet:
+① Phase 2: LLM Dual-round Evaluation (mixed R1+R2 batch pool)
+② Phase 3: LLM Polish (up to 3 rounds)
+③ Phase 4a: Retranslation Protection
+④ Phase 4b: Template Correction (executed after all worksheets)
+⑤ Generate Reports
 ```
 
 ---
@@ -117,17 +131,10 @@ BASE_URL=https://openrouter.ai/api/v1
 
 ## Usage
 
+### Running the Main translation script
 Place the translation target Excel and glossary (optional) into the `workplace/` directory, then run the main controller script.
 
-### Running the Main Controller
-
-```bash
-cd <script directory>
-python batch_translate.py
-```
-Or run `batch_translate.py` directly.
-
-### Interactive Steps
+### Interactive Steps (Translation)
 
 ```
 Step 1: Select target Excel  → Lists all .xlsx files under workplace/
@@ -137,7 +144,7 @@ Step 4: Select range         → All untranslated / First N for testing / Specif
 Step 5: Confirm execution    → Shows summary, press Y to confirm
 ```
 
-### Output After Execution
+### Output After Execution (Translation)
 
 All output files are placed under the `workplace/` directory:
 
@@ -149,13 +156,38 @@ All output files are placed under the `workplace/` directory:
 
 ---
 
+### Usage: Proofreading
+Place the translated Excel into `workplace/` and run `batch_proofread.py`.
+> ⚠️ **Note**: The proofreading pipeline currently only supports **single worksheet** processing.
+
+### Interactive Steps (Proofreading)
+
+```
+Step 1: Select target Excel    → Lists all .xlsx files under workplace/
+Step 2: Select glossary (required) → Choose a glossary Excel or auto-extract (proofreading requires a glossary, cannot skip)
+Step 3: Select worksheet       → Choose the worksheet to proofread
+Step 4: Select proofreading range → Select the entry range to proofread
+Step 5: Confirm execution      → Starts proofreading (Phase 2→3→4a→4b→Reports)
+```
+
+### Output After Execution (Proofreading)
+
+| File | Description |
+|------|---------|
+| `{source_name}_proofread_output.xlsx` | **Proofread Excel file** |
+| `proofread_report.xlsx` | **Proofreading summary report** (Type1/Type2 color-coded) |
+| `review_report_proofread.xlsx` | **Retranslation protection review details** |
+| `_proofread_checkpoint/` | **Checkpoint resume temp directory**, located in `workplace/` (auto-deleted after completion) |
+
+---
+
 ### Checkpoint Resume
 
-If the translation is interrupted due to network issues, API errors, or manual interruption (Ctrl+C), the script supports resuming from where it left off:
+If the translation/proofreading is interrupted due to network issues, API errors, or manual interruption (Ctrl+C), the script supports resuming from where it left off:
 
 **Resume workflow:**
-1. Re-run `batch_translate.py`
-2. The script automatically scans `workplace/_checkpoint/session.json` to detect unfinished progress
+1. Re-run `batch_translate.py` / `batch_proofread.py`
+2. The script automatically scans `workplace/_checkpoint/session.json` (translation) or `workplace/_proofread_checkpoint/session.json` (proofreading) to detect unfinished progress
 3. Displays a summary of the last translation settings (Excel, worksheet, progress)
 4. Asks whether to resume:
 
@@ -172,7 +204,7 @@ If the translation is interrupted due to network issues, API errors, or manual i
 Resume the previous translation? (Y/n):
 ```
 
-5. Choose `Y` → automatically loads glossary settings, restores translated entries, and resumes from the interruption point
+5. Choose `Y` → automatically loads glossary settings, restores translated/proofread entries, and resumes from the interruption point
 6. Choose `n` → clears old checkpoint and starts a fresh translation
 
 > ⚠️ **Note**: The checkpoint resume feature **ensures the vast majority of translated progress is saved, but not 100%**. In extreme cases (such as abrupt shutdown), the last 1-2 batches that were completed but not yet written to checkpoint may not be recoverable.
@@ -252,12 +284,12 @@ The following constants are located in `api_config.py` and `llm_translator.py`. 
 
 ### Benchmarks (DeepSeek V4 Flash, evening hours)
 
-| Entries | Average Cost | Time (3 test runs) |
-|---------|---------------|----------------|
-| 500 | 0.01-0.02 USD | 329s, 467s, 353s |
-| 2,000 | 0.06-0.07 USD | 801s, 746s, 696s |
-| 5,000 | 0.14 USD | 2084s, 1465s, 2170s |
-| 75,000 | 2.39 USD | 8 hours |
+| Entries | Avg Cost (Translation) | Translation Time (3 runs) | Avg Cost (Proofreading) | Proofreading Time (3 runs) |
+|---------|---------------|----------------|----------|----------------|
+| 500 | 0.01-0.02 USD | 329s, 467s, 353s | 0.02 USD | 350s, 387s, 461s |
+| 2,000 | 0.06-0.07 USD | 801s, 746s, 696s | 0.07-0.08 USD | 912s, 1243s |
+| 5,000 | 0.14 USD | 2084s, 1465s, 2170s | |
+| 75,000 | 2.39 USD | 8 hours | | |
 
 ### Benchmarks (Paid vs Free API Speed Comparison)
 
@@ -338,6 +370,18 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 
 **Q: The message `JSON repair successful` appears**
 <br>A: The model's response contained minor JSON formatting issues (e.g., missing commas or colons). `json_repair` has automatically fixed them — no impact on translation results.
+
+### Proofreading Related
+
+**Q: The message `[APIx] ⚠️ Completion rate 40% (4/10) below 75%, retrying` appears**
+<br>A: The 75% completion rate check is a normal mechanism in the proofreading phase. It automatically retries up to 3 attempts. If still below 75% after 3 tries, it accepts the result and logs debug info.
+
+**Q: What are Type1 and Type2 in the proofreading report?**
+<br>A: Type1 refers to terminology/placeholder/untranslated issues that can be automatically detected by scripts, marked with background colors. Type2 refers to fluency issues found by LLM dual-round evaluation — entries judged acceptable in both rounds are skipped.
+
+**Q: Can proofreading handle multiple worksheets?**
+<br>A: Currently only supports single worksheet processing. For multiple worksheets, run the proofreading script for each worksheet separately.
+
 ---
 
 ## License

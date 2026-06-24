@@ -18,7 +18,7 @@
 - Added auto-extract glossary from the target Excel's name and manual sheets, no separate file required
 - Unified workplace/ directory for all inputs and outputs, simplifying the workflow
 - Extended retranslation to three-layer checks: terminology, placeholder corruption, and untranslated entries
-- Fixed false positives in review report: when overlapping terms exist (e.g. “Lord Hosidius” vs “Hosidius”), correct longer-term translation no longer triggers a false alarm on the shorter term
+- Fixed false positives in review report: when overlapping terms exist (e.g. "Lord Hosidius" vs "Hosidius"), correct longer-term translation no longer triggers a false alarm on the shorter term
 - Enhanced interactive UI: per-batch API indicators, detailed retranslation stats, and comprehensive stage timestamps
 - Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
 
@@ -42,7 +42,7 @@
 - Improved API compatibility: unified handling of format differences across Nvidia, opencode, OpenRouter, and other providers
 - New dependency: json-repair — run pip install json-repair to install
 
-## 20/6/2026 v0.21 -> v0.2.2
+## 20/6/2026 v0.2.1 -> v0.2.2
 
 ### 中文
 - 修正多工作表翻譯：原始設計已支援，但存在多項 BUG（範圍選擇/輸出/續傳），現已全面修復
@@ -61,3 +61,40 @@
 - Added enforce checkpoint resume: if the retranslation phase (enforce) is interrupted, re-running will continue from the interrupted round without wasting API calls
 - save_session() now uses atomic write (.tmp → rename) to prevent session.json corruption on interrupt
 - Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
+
+## 24/6/2026 v0.2.2 -> v0.3
+
+### 中文
+- 新增校對管線（proofreader.py + batch_proofread.py）：
+  - 三階段流程：LLM 雙輪評估（Phase 2）→ LLM 潤色（Phase 3）→ 重譯保護（Phase 4a）+ 模板校正（Phase 4b）
+  - Phase 2 混合 R1+R2 批次池：R1 和 R2 的所有批次混合在一個 worker pool 中處理，而非順序執行兩輪
+  - 雙輪交叉驗證：僅有兩次皆為 {沒問題, 輕度} 的任意組合才跳過，其餘列為第二類問題條目
+  - 75% 完成率閾值：所有 API 回傳（含正常路徑與 json_repair 修復路徑）皆檢查，低於 75% 即重試，最高優先級
+  - 互動式 CLI，支援續傳、debug 訊息檢視、備份與雙報告輸出（proofread_report.xlsx + review_report_proofread.xlsx）
+  - 獨立 checkpoint 目錄（_proofread_checkpoint/），不與主翻譯干擾
+- ⚠️ **已知限制**：校對管線目前只支援**單工作表**處理，不支援多工作表。
+- 移除 response_format：
+  - `_translate_batch()`（llm_translator.py）移除 `response_format={"type": "json_object"}`
+  - `_evaluate_batch()` 和 `_polish_batch()`（proofreader.py）移除 `response_format={"type": "json_object"}`
+  - 所有提示詞改為直接要求「原始 JSON 阵列（不要使用 ```json 代码块包裹）」
+  - 保留智慧 JSON 提取（方法一/二）和 json_repair 修復作為後備保障
+- 共用 `run_worker_pool()` 提取至 llm_translator.py，供翻譯與校對共用
+- 擴充內建術語庫（ADD_LIST）與排除清單（IGNORE_LIST）條目
+
+### English
+- Added proofreading pipeline (proofreader.py + batch_proofread.py):
+  - Three-phase flow: LLM Dual-round Evaluation (Phase 2) → LLM Polish (Phase 3) → Retry Protect (Phase 4a) + Template Correction (Phase 4b)
+  - Phase 2 mixed R1+R2 batch pool: all R1 and R2 batches processed in one worker pool instead of sequential passes
+  - Dual-round cross-validation: skips only when both rounds are {acceptable, mild} in any combination; all others flagged as category 2
+  - 75% completion rate threshold: checked on all API returns (normal path + json_repair path), triggers retry below 75%, highest priority
+  - Interactive CLI with resume, debug message review, backup, and dual report output (proofread_report.xlsx + review_report_proofread.xlsx)
+  - Isolated checkpoint directory (_proofread_checkpoint/) independent from main translation
+- ⚠️ **Known limitation**: The proofreading pipeline currently only supports **single worksheet** processing. Multi-sheet support is not yet implemented.
+- Removed response_format:
+  - `_translate_batch()` (llm_translator.py) removed `response_format={"type": "json_object"}`
+  - `_evaluate_batch()` and `_polish_batch()` (proofreader.py) removed `response_format={"type": "json_object"}`
+  - All prompts now directly require "raw JSON array (do not use ```json code blocks)"
+  - Retained smart JSON extraction (method 1/2) and json_repair as fallbacks
+- Extracted shared `run_worker_pool()` to llm_translator.py, used by both translation and proofreading
+- Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
+
