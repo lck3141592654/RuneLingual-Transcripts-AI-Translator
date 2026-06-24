@@ -1,4 +1,4 @@
-# Runelingual Transcripts 混合翻譯管線
+# OSRS Transcripts 混合翻譯管線
 
 <div align="center">
 

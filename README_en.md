@@ -1,4 +1,4 @@
-# Runelingual Transcripts Hybrid Translation Pipeline
+# OSRS Transcripts Hybrid Translation Pipeline
 
 <div align="center">
 
