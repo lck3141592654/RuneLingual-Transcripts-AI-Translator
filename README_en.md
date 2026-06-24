@@ -12,11 +12,12 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 24/6/2026, see [Changelog](Changelog.md) for details
-- **New proofreading pipeline**: Added `proofreader.py` + `batch_proofread.py` with LLM dual-round evaluation, polishing, and retranslation protection
-- **Removed response_format**: All API calls (translation and proofreading) now use prompt to directly request raw JSON arrays for better compatibility
-- Shared `run_worker_pool()` and `get_relevant_glossary()` extracted to `llm_translator.py`, used by both translation and proofreading
-- Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
+## Latest Update on 25/6/2026, see [Changelog](Changelog.md) for details
+- **New space check**: Added a fourth layer to `scan_issues()` detecting six types of spacing issues (consecutive spaces, spaces between Chinese characters, space before/after Chinese/English punctuation). Displayed in green in review reports.
+- **New script preprocessing**: Applies mechanical fixes before each of the 3 LLM retranslation rounds, reducing API calls
+  - Single placeholder fix: when the source has exactly one `[]`, overwrites the translation's `[]` content with the source's
+  - Space fix: automatically removes six types of abnormal spaces while preserving legitimate ones
+- **Fixed false positive for placeholder-only entries**: Entries where removing all `[]` leaves only whitespace or punctuation are no longer flagged as untranslated
 
 ### Features
 
@@ -25,7 +26,7 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 - **Interactive operation**: Supports selecting sheets and entry ranges
 - **Async concurrency**: Sends multiple API requests simultaneously, significantly reducing translation time
 - **Checkpoint resume**: If the translation is interrupted due to network issues or manual interruption (Ctrl+C), simply re-run the script to resume from where it left off — no need to start over
-- **Auto-review**: Three-layer checks (terminology / placeholders / untranslated), generates a color-coded review report
+- **Auto-review**: Four-layer checks (terminology / placeholders / untranslated / spacing), generates a color-coded review report
 - **Multi-API support**: Supports using multiple API keys simultaneously (main/fallback classification), round-robin task distribution, automatic 429 rate-limit handling (cooldown/permanent disable), maximizing translation throughput
 - **Automated proofreading workflow**: LLM dual-round evaluation cross-validation + up to 3 rounds of polishing + retranslation protection, produces color-coded proofreading reports
 - **Glossary-based proofreading**: Enforces glossary during proofreading to prevent the LLM from deviating from correct terminology when polishing
@@ -40,7 +41,7 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 | `glossary.py` | Reads terminology Excel or auto-extracts glossary from target + outputs review file |
 | `tm_matcher.py` | Template matching (**not yet enabled**, will be added in the official release) |
 | `llm_translator.py` | **AI batch translation core**, async parallel calls, with smart JSON extraction and json_repair fallback |
-| enforcer.py | **Three-layer enforcement** (terminology/placeholders/untranslated), auto-correction + color-coded review report |
+| enforcer.py | **Four-layer enforcement** (terminology/placeholders/untranslated/spacing), with script preprocessing, auto-correction + color-coded review report |
 | `api_config.py` | Multi-API configuration parser, supports main/fallback classification, category-level default concurrency, per-API overrides |
 | `.env` | API configuration file, supports multi-API numbered format and legacy single-API format |
 | `.env.example` | Configuration template |
@@ -61,7 +62,7 @@ batch_translate.py → executes in order:
 ① glossary.py      Load terminology database
 ② tm_matcher.py    Template parameter matching ⚠️ Not yet enabled, will be added in official release
 ③ llm_translator.py AI batch translation (async parallel)
-④ enforcer.py      Three-layer enforcement + retranslation + checkpoint resume + color-coded review report
+④ enforcer.py      Four-layer enforcement + script preprocessing + retranslation + checkpoint resume + color-coded review report
 ```
 ```
 Proofreading Script

@@ -98,3 +98,19 @@
 - Extracted shared `run_worker_pool()` to llm_translator.py, used by both translation and proofreading
 - Expanded built-in term list (ADD_LIST) and ignore list (IGNORE_LIST)
 
+
+## 25/6/2026 v0.3 -> v0.3.1
+
+### 中文
+- **新增空格檢查**：`scan_issues()` 加入第四層檢查，檢測六種空格問題（連續多個空格、中文字間空格、空格+中文/英文標點、中文/英文標點+空格），審查報告以綠色標示
+- **新增腳本預處理機制**：在 LLM 重譯前三輪皆先執行機械式修正，減少 API 調用
+  - 單佔位符修正：原文僅含一個 `[]` 時，直接用原文內容覆蓋譯文的 `[]` 內容
+  - 空格修正：自動清除六種不合格空格，保留正常合理空格
+- **修正純佔位符誤判**：原文去除 `[]` 後僅剩空白或標點符號時，不再視為未翻譯
+
+### English
+- **New space check**: Added a fourth layer to `scan_issues()` detecting six types of spacing issues (consecutive spaces, spaces between Chinese characters, space before/after Chinese/English punctuation). Displayed in green in review reports.
+- **New script preprocessing**: Applies mechanical fixes before each of the 3 LLM retranslation rounds, reducing API calls
+  - Single placeholder fix: when the source has exactly one `[]`, overwrites the translation's `[]` content with the source's
+  - Space fix: automatically removes six types of abnormal spaces while preserving legitimate ones
+- **Fixed false positive for placeholder-only entries**: Entries where removing all `[]` leaves only whitespace or punctuation are no longer flagged as untranslated

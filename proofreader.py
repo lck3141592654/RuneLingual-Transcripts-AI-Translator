@@ -897,13 +897,14 @@ def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_secon
             fp = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
             fu = PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
             ic = None
+            fs = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
             for ci, cell in enumerate(ws[1], start=1):
                 if cell.value == "issue":
                     ic = ci; break
             if ic:
                 for row in ws.iter_rows(min_row=2):
                     v = str(row[ic-1].value) if row[ic-1].value else ""
-                    fill = fg if v.startswith("[glossary]") else (fp if v.startswith("[placeholder]") else (fu if v.startswith("[untranslated]") else None))
+                    fill = fg if v.startswith("[glossary]") else (fp if v.startswith("[placeholder]") else (fu if v.startswith("[untranslated]") else (fs if v.startswith("[space]") else None)))
                     if fill:
                         for cell in row:
                             cell.fill = fill

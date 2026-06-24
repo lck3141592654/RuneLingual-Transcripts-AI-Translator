@@ -94,9 +94,70 @@ def check_untranslated(english_text: str, translated_text) -> list[str]:
     # 情況 B：譯文與原文相同（不分大小寫），且原文包含英文字母
     if trans_str.lower() == english_text.strip().lower():
         if re.search(r'[a-zA-Z]', english_text):
-            issues.append("譯文與原文相同，未實際翻譯")
+            # 排除純佔位符條目：去除 [] 後只留下空白或標點符號時不視為未翻譯
+            stripped = re.sub(r'\[.*?\]', '', english_text).strip()
+            if stripped and re.search(r'[a-zA-Z]', stripped):
+                issues.append("譯文與原文相同，未實際翻譯")
     return issues
 
+
+def check_space_issues(translated_text: str) -> list:
+    """檢查譯文中的四種空格問題，回傳問題清單 list[(type, suggested_fix, desc)]"""
+    issues = []
+    if translated_text is None or (isinstance(translated_text, float) and pd.isna(translated_text)):
+        return issues
+    trans_str = str(translated_text)
+    if '  ' in trans_str:
+        issues.append(("space", "", "存在連續多個空格"))
+    if re.search(r'[\u4e00-\u9fff] [\u4e00-\u9fff]', trans_str):
+        issues.append(("space", "", "中文字間不應有空格"))
+    if re.search(r' [\u4e00-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001]', trans_str):
+        issues.append(("space", "", "空格後不應直接接中文標點符號"))
+    if re.search(r'[\u4e00-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001] ', trans_str):
+        issues.append(("space", "", "中文標點符號後不應有空格"))
+    if re.search(r' [\.!\?,;:]', trans_str):
+        issues.append(("space", "", "空格後不應直接接英文標點符號"))
+    if re.search(r'[\.!\?,;:] ', trans_str):
+        issues.append(("space", "", "英文標點符號後不應有空格"))
+    return issues
+
+
+def fix_single_placeholder(english_text: str, translated_text: str) -> str:
+    """若原文只有一個 [] 佔位符，直接用原文的 [] 內容覆蓋譯文的 [] 內容"""
+    eng_phs = re.findall(r'\[(.*?)\]', english_text)
+    if len(eng_phs) != 1:
+        return translated_text
+    target_ph = f"[{eng_phs[0]}]"
+    trans_phs = re.findall(r'\[(.*?)\]', translated_text)
+    if trans_phs:
+        old_ph = f"[{trans_phs[0]}]"
+        if old_ph != target_ph:
+            return translated_text.replace(old_ph, target_ph)
+    return translated_text
+
+
+def fix_space_issues(text: str) -> str:
+    """清除四種不合格空格，保留正常空格"""
+    text = re.sub(r' {2,}', ' ', text)
+    text = re.sub(r'([\u4e00-\u9fff]) ([\u4e00-\u9fff])', r'\1\2', text)
+    text = re.sub(r' ([\u4e00-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001])', r'\1', text)
+    text = re.sub(r'([\u4e00-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001]) ', r'\1', text)
+    text = re.sub(r' [\.!\?,;:]', r'', text)
+    text = re.sub(r'[\.!\?,;:] ', r'', text)
+    return text
+def preprocess_issues(df, pool):
+    """對問題條目進行腳本預處理（單佔位符修正 + 空格修正），直接修改 df"""
+    for idx, row, issues in pool:
+        eng = str(row.get("english", ""))
+        trans = row.get("translation")
+        if trans is None or (isinstance(trans, float) and pd.isna(trans)):
+            continue
+        new_trans = str(trans)
+        new_trans = fix_single_placeholder(eng, new_trans)
+        new_trans = fix_space_issues(new_trans)
+        if new_trans != str(trans):
+            df.at[idx, "translation"] = new_trans
+    return df
 def scan_issues(df, relevant_glossary) -> list[tuple]:
     """走訪所有行，彙整三種檢查的結果，回傳問題 pool"""
     pool = []
@@ -125,6 +186,11 @@ def scan_issues(df, relevant_glossary) -> list[tuple]:
         if ph_issues:
             for pi in ph_issues:
                 all_issues.append(("placeholder", "", pi))
+
+        # 空格檢查
+        space_issues = check_space_issues(trans_str)
+        for _, _, desc in space_issues:
+            all_issues.append(("space", "", desc))
 
         if all_issues:
             pool.append((idx, row, all_issues))
@@ -213,10 +279,45 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
     for rnd in range(start_round, 3):
         pool = scan_issues(df, relevant_glossary)
 
+
+        # ★ 腳本預處理（每輪重譯前都執行）
+        if pool:
+            # 統計預處理前的問題類型
+            glossary_cnt = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "glossary")
+            ph_cnt = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "placeholder")
+            untranslated_cnt = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "untranslated")
+            space_cnt = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "space")
+            before_parts = []
+            if glossary_cnt > 0:
+                before_parts.append(f"術語 {glossary_cnt} 條")
+            if ph_cnt > 0:
+                before_parts.append(f"佔位符 {ph_cnt} 條")
+            if untranslated_cnt > 0:
+                before_parts.append(f"未翻譯 {untranslated_cnt} 條")
+            if space_cnt > 0:
+                before_parts.append(f"空格 {space_cnt} 條")
+            if before_parts:
+                print(f"  ⚡ 腳本預處理前問題：{'、'.join(before_parts)}")
+
+            pre_count_before = len(pool)
+            preprocess_issues(df, pool)
+            pool = scan_issues(df, relevant_glossary)
+
+            # 統計修正了哪些類型
+            space_after = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "space")
+            ph_after = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "placeholder")
+            solved_parts = []
+            solved_space = space_cnt - space_after
+            solved_ph = ph_cnt - ph_after
+            if solved_space > 0:
+                solved_parts.append(f"空格 {solved_space} 條")
+            if solved_ph > 0:
+                solved_parts.append(f"佔位符 {solved_ph} 條")
+            if solved_parts:
+                print(f"  ⚡ 腳本預處理修正：{'、'.join(solved_parts)}")
         if not pool:
             print(f"  第 {rnd + 1} 轮检查：全部正确")
             break
-
         if len(pool) < 3:
             print(f"  第 {rnd + 1} 轮检查：{len(pool)} 条有问题（少于3条，跳过重译）")
             break
@@ -225,12 +326,15 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
         gloss_count = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "glossary")
         ph_count = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "placeholder")
         untrans_count = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "untranslated")
+        space_count = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "space")
         print(f"  ── 掃描問題條目 ──")
         print(f"    術語檢查：{gloss_count} 條")
         if ph_count > 0:
             print(f"    佔位符檢查：{ph_count} 條")
         if untrans_count > 0:
             print(f"    未翻譯檢查：{untrans_count} 條")
+        if space_count > 0:
+            print(f"    空格檢查：{space_count} 條")
         print(f"  第 {rnd + 1} 轮检查：{len(pool)} 条有问题，进行重譯...")
 
         pre_count = len(pool)
@@ -389,6 +493,7 @@ def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = No
         fill_glossary = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
         fill_placeholder = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
         fill_untranslated = PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
+        fill_space = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
 
         with pd.ExcelWriter(fp, engine='openpyxl') as writer:
             review_df.to_excel(writer, index=False, sheet_name='Sheet1')
@@ -411,6 +516,8 @@ def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = No
                         fill = fill_placeholder
                     elif issue_val.startswith("[untranslated]"):
                         fill = fill_untranslated
+                    elif issue_val.startswith("[space]"):
+                        fill = fill_space
                     else:
                         continue
                     for cell in row:
