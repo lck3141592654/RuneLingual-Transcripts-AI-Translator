@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import sys
-import os
 import json
+import asyncio
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -10,9 +10,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from glossary import load_glossary
 from tm_matcher import match_and_fill
-from llm_translator import translate_all as llm_translate
+from llm_translator import prepare_sheet_translation, translate_sheet_phase
 from llm_translator import save_session, delete_checkpoint_files, load_backup
-from enforcer import enforce
+from enforcer import enforce_async
+from shared_pool import SharedBatchPool
 
 
 SEP = "=" * 60
@@ -146,7 +147,7 @@ def step3(excel_path: Path) -> list[str]:
         return sheets
     return choose_multi(sheets, "選擇翻譯目標工作表：")
 
-def step4_choose_sheet_mode(sheet_name: str, untranslated_count: int) -> dict:
+def step4_choose_sheet_mode(untranslated_count: int) -> dict:
     """
     選擇單一工作表的翻譯範圍模式。
     回傳模式 dict:
@@ -292,7 +293,7 @@ def _write_outputs(excel_path: Path, workplace: Path, all_translated_dfs: dict,
         combined_review.to_excel(report_path, index=False, sheet_name='Sheet1')
 
         # ── 補上顏色標記（與 enforcer.py 一致） ──
-        from openpyxl.styles import PatternFill
+        from openpyxl.styles import Color, PatternFill
         from openpyxl import load_workbook
 
         wb = load_workbook(report_path)
@@ -305,9 +306,10 @@ def _write_outputs(excel_path: Path, workplace: Path, all_translated_dfs: dict,
                 break
 
         if issue_col:
-            fill_glossary = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-            fill_placeholder = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-            fill_untranslated = PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
+            fill_glossary = PatternFill(start_color=Color(rgb="D9D9D9"), end_color=Color(rgb="D9D9D9"), fill_type="solid")
+            fill_placeholder = PatternFill(start_color=Color(rgb="BDD7EE"), end_color=Color(rgb="BDD7EE"), fill_type="solid")
+            fill_untranslated = PatternFill(start_color=Color(rgb="F4CCCC"), end_color=Color(rgb="F4CCCC"), fill_type="solid")
+            fill_space = PatternFill(start_color=Color(rgb="E2EFDA"), end_color=Color(rgb="E2EFDA"), fill_type="solid")
 
             for row in ws.iter_rows(min_row=2, max_col=ws.max_column, max_row=ws.max_row):
                 issue_val = str(row[issue_col - 1].value) if row[issue_col - 1].value else ""
@@ -317,6 +319,8 @@ def _write_outputs(excel_path: Path, workplace: Path, all_translated_dfs: dict,
                     fill = fill_placeholder
                 elif issue_val.startswith("[untranslated]"):
                     fill = fill_untranslated
+                elif issue_val.startswith("[space]"):
+                    fill = fill_space
                 else:
                     continue
                 for cell in row:
@@ -335,7 +339,102 @@ def _write_outputs(excel_path: Path, workplace: Path, all_translated_dfs: dict,
     print(SEP)
     input("\n按 Enter 關閉...")
 
-def main():
+async def _run_translation_pipeline(excel_path, workplace, glossary, glossary_path, glossary_sheets,
+                                    sheet_configs, pending_sheets, completed_sheets,
+                                    all_translated_dfs, all_review_rows):
+    # Phase-barrier parallel translation:
+    # Phase A local template match -> Phase B LLM translate (all sheets) -> Phase C enforce (all sheets).
+    pool = SharedBatchPool()
+    await pool.start()
+    active = [c for c in pool.api_configs if not c.is_permanently_disabled]
+    print(f"  已載入 {len(active)} 個可用 API：")
+    for cfg in active:
+        print(f"    {cfg.api_id} {cfg.model_provider}/{cfg.model} ({cfg.api_type}, 並發={cfg.parallel_limit})")
+    try:
+        # Phase A: local prep per sheet (restore backup + template match)
+        sheet_states = {}
+        for sheet_name in pending_sheets:
+            timestamp(f"讀取 {sheet_name}...")
+            df_full = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
+            print(f"    總條數: {len(df_full)}")
+            sheet_cfg = sheet_configs.get(sheet_name, {})
+            selected_indices = set(sheet_cfg.get("selected_indices", []))
+            if not selected_indices:
+                print(f"  {sheet_name} 沒有選取任何條目，跳過")
+                all_translated_dfs[sheet_name] = df_full
+                completed_sheets.append(sheet_name)
+                continue
+            mask = df_full.index.isin(selected_indices) & (
+                df_full["translation"].isna() | (df_full["translation"].isnull())
+            )
+            df = df_full[mask].copy()
+            remaining = len(df)
+            if remaining == 0:
+                print(f"  {sheet_name} 已全部翻譯完成，跳過")
+                all_translated_dfs[sheet_name] = df_full
+                completed_sheets.append(sheet_name)
+                continue
+            t2 = datetime.now()
+            timestamp("模板參數化比對...")
+            df, pending = prepare_sheet_translation(df, str(workplace), sheet_name)
+            df = match_and_fill(df, glossary)
+            matched = int((df["_status"] == "已處理").sum())
+            elapsed(t2, "模板比對")
+            print(f"    模板匹配完成: {matched} 條已處理")
+            pending_count = int((df["translation"].isna() | (df["translation"] == "nan")).sum())
+            print(f"    待翻譯: {pending_count} 條")
+            sheet_states[sheet_name] = {"df_full": df_full, "df": df, "pending": pending}
+
+        # Phase B: LLM translation (all sheets in parallel, shared pool)
+        t3 = datetime.now()
+        timestamp("LLM 批次翻譯（全部工作表並行）...")
+        await asyncio.gather(*[
+            translate_sheet_phase(st["df"], glossary, str(workplace), st["pending"], sheet_name, pool)
+            for sheet_name, st in sheet_states.items()
+        ])
+        elapsed(t3, "LLM 翻譯")
+        save_session(str(workplace), _build_session_data(
+            excel_path, glossary_path, glossary_sheets,
+            pending_sheets[0] if pending_sheets else "",
+            completed_sheets, pending_sheets, sheet_configs,
+            accumulated_review_rows=all_review_rows))
+
+        # Phase C: enforce (all sheets in parallel, shared pool)
+        t4 = datetime.now()
+        timestamp("術語強制後處理（全部工作表並行）...")
+        results = await asyncio.gather(*[
+            enforce_async(st["df"], glossary, str(workplace),
+                          report_name=f"review_report_{sheet_name}.xlsx",
+                          write_report=False, sheet_name=sheet_name, shared_pool=pool)
+            for sheet_name, st in sheet_states.items()
+        ], return_exceptions=True)
+        for sheet_name, res in zip(sheet_states, results):
+            if isinstance(res, BaseException):
+                if isinstance(res, RuntimeError) and "all APIs permanently disabled" in str(res):
+                    print("\n  ⚠️所有 API 已永久停用（兩次 429 限流），無法繼續")
+                    print("  已儲存部分翻譯進度，請檢查 API Key 後重新執行即可續傳")
+                raise res
+            df, review_df = res
+            if not review_df.empty:
+                review_df.insert(0, "sheet_name", sheet_name)
+                all_review_rows.append(review_df)
+            sheet_states[sheet_name]["df_full"].update(df)
+            all_translated_dfs[sheet_name] = sheet_states[sheet_name]["df_full"]
+            completed_sheets.append(sheet_name)
+            timestamp(f"✅ {sheet_name} 完成")
+        elapsed(t4, "術語強制後處理")
+
+        # All sheets done: update session
+        pending_sheets.clear()
+        save_session(str(workplace), _build_session_data(
+            excel_path, glossary_path, glossary_sheets,
+            "", completed_sheets, pending_sheets, sheet_configs,
+            accumulated_review_rows=all_review_rows))
+    finally:
+        await pool.close()
+
+
+async def main():
     print(SEP)
     print("      混合翻譯管線 v1.5")
     print(f"      工作目錄: {_get_workplace()}")
@@ -410,7 +509,6 @@ def main():
             all_review_rows = []
 
             # ── 還原已完成工作表資料 ──
-            from llm_translator import load_backup
             for sn in completed_sheets:
                 timestamp(f"從檢查點還原工作表: {sn}...")
                 df_full = pd.read_excel(excel_path, sheet_name=sn, dtype=str)
@@ -432,79 +530,9 @@ def main():
                     all_review_rows.append(pd.DataFrame(rows))
                     print(f"    還原 {len(rows)} 條審查記錄")
 
-            while pending_sheets:
-                sheet_name = pending_sheets[0]
-
-                print(f"\n{SEP}")
-                print(f"  處理工作表: {sheet_name}")
-                print(SEP)
-
-                t1 = datetime.now()
-                timestamp(f"讀取 {sheet_name}...")
-                df_full = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
-                print(f"    總條數: {len(df_full)}")
-
-                sheet_cfg = sheet_configs.get(sheet_name, {})
-                selected_indices = set(sheet_cfg.get("selected_indices", []))
-                if selected_indices:
-                    mask = df_full.index.isin(selected_indices) & (
-                        df_full["translation"].isna() | (df_full["translation"].isnull())
-                    )
-                    df = df_full[mask].copy()
-                    print(f"    還原選取範圍，剩餘未翻譯: {len(df)} 條")
-                else:
-                    df = df_full[df_full["translation"].isna() | (df_full["translation"].isnull())].copy()
-                    print(f"    無法還原選取範圍（相容模式），未翻譯: {len(df)} 條")
-
-                if len(df) == 0:
-                    print(f"  {sheet_name} 無需翻譯，跳過")
-                    all_translated_dfs[sheet_name] = df_full
-                    pending_sheets.pop(0)
-                    completed_sheets.append(sheet_name)
-                    save_session(str(workplace), _build_session_data(
-                        excel_path, glossary_path, glossary_sheets,
-                        pending_sheets[0] if pending_sheets else "",
-                        completed_sheets, pending_sheets, sheet_configs,
-                        accumulated_review_rows=all_review_rows))
-                    continue
-
-                t2 = datetime.now()
-                timestamp("模板參數化比對...")
-                df = match_and_fill(df, glossary)
-                matched = int((df["_status"] == "已處理").sum())
-                elapsed(t2, "模板比對")
-                print(f"    模板匹配完成: {matched} 條已處理")
-
-                pending_count = int((df["translation"].isna() | (df["translation"] == "nan")).sum())
-                timestamp(f"LLM 批次翻譯（待翻譯: {pending_count} 條）...")
-                t3 = datetime.now()
-                if pending_count > 0:
-                    df = llm_translate(df, glossary, str(workplace), sheet_name=sheet_name)
-                else:
-                    print("    無需 LLM 翻譯")
-                elapsed(t3, "LLM 翻譯")
-
-                t4 = datetime.now()
-                timestamp("術語強制後處理...")
-                df, review_df = enforce(df, glossary, str(workplace),
-                                        report_name=f"review_report_{sheet_name}.xlsx",
-                                        write_report=False, sheet_name=sheet_name)
-                if not review_df.empty:
-                    review_df.insert(0, "sheet_name", sheet_name)
-                    all_review_rows.append(review_df)
-                elapsed(t4, "術語強制後處理")
-
-                df_full.update(df)
-                all_translated_dfs[sheet_name] = df_full
-
-                pending_sheets.pop(0)
-                completed_sheets.append(sheet_name)
-                next_sheet = pending_sheets[0] if pending_sheets else ""
-                save_session(str(workplace), _build_session_data(
-                    excel_path, glossary_path, glossary_sheets,
-                    next_sheet, completed_sheets, pending_sheets, sheet_configs,
-                    accumulated_review_rows=all_review_rows))
-                print(f"  ✅ {sheet_name} 完成")
+            await _run_translation_pipeline(excel_path, workplace, glossary, glossary_path, glossary_sheets,
+                                                    sheet_configs, pending_sheets, completed_sheets,
+                                                    all_translated_dfs, all_review_rows)
 
             _write_outputs(excel_path, workplace, all_translated_dfs, all_review_rows, overall_start)
             return
@@ -541,7 +569,7 @@ def main():
         print(f"\n{SEP}")
         print(f"  設定工作表：{sn}（{uc} 條未翻譯）")
         print(SEP)
-        sn_mode = step4_choose_sheet_mode(sn, uc)
+        sn_mode = step4_choose_sheet_mode(uc)
         df_filtered = step4_apply_mode(cached_dfs[sn], sn_mode)
         sheet_configs[sn] = {
             "mode": sn_mode,
@@ -572,95 +600,17 @@ def main():
     all_review_rows = []
     completed_sheets = []
 
-    while pending_sheets:
-        sheet_name = pending_sheets[0]
-        print(f"\n{SEP}")
-        print(f"  處理工作表: {sheet_name}")
-        print(SEP)
 
-        t1 = datetime.now()
-        timestamp(f"讀取 {sheet_name}...")
-        df_full = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
-        print(f"    總條數: {len(df_full)}")
+    await _run_translation_pipeline(excel_path, workplace, glossary, glossary_path, glossary_sheets,
+                                            sheet_configs, pending_sheets, completed_sheets,
+                                            all_translated_dfs, all_review_rows)
 
-        sheet_cfg = sheet_configs.get(sheet_name, {})
-        selected_indices = set(sheet_cfg.get("selected_indices", []))
-        if not selected_indices:
-            print(f"  {sheet_name} 沒有選取任何條目，跳過")
-            all_translated_dfs[sheet_name] = df_full
-            pending_sheets.pop(0)
-            completed_sheets.append(sheet_name)
-            next_sheet = pending_sheets[0] if pending_sheets else ""
-            save_session(str(workplace), _build_session_data(
-                excel_path, glossary_path, glossary_sheets,
-                next_sheet, completed_sheets, pending_sheets, sheet_configs,
-                accumulated_review_rows=all_review_rows))
-            continue
-
-        mask = df_full.index.isin(selected_indices) & (
-            df_full["translation"].isna() | (df_full["translation"].isnull())
-        )
-        df = df_full[mask].copy()
-        remaining = len(df)
-        print(f"    還原選取範圍，剩餘未翻譯: {remaining} 條")
-
-        if remaining == 0:
-            print(f"  {sheet_name} 已全部翻譯完成，跳過")
-            all_translated_dfs[sheet_name] = df_full
-            pending_sheets.pop(0)
-            completed_sheets.append(sheet_name)
-            next_sheet = pending_sheets[0] if pending_sheets else ""
-            save_session(str(workplace), _build_session_data(
-                excel_path, glossary_path, glossary_sheets,
-                next_sheet, completed_sheets, pending_sheets, sheet_configs,
-                accumulated_review_rows=all_review_rows))
-            continue
-
-        t2 = datetime.now()
-        timestamp("模板參數化比對...")
-        df = match_and_fill(df, glossary)
-        matched = int((df["_status"] == "已處理").sum())
-        elapsed(t2, "模板比對")
-        print(f"    模板匹配完成: {matched} 條已處理")
-
-        pending_count = int((df["translation"].isna() | (df["translation"] == "nan")).sum())
-        timestamp(f"LLM 批次翻譯（待翻譯: {pending_count} 條）...")
-        t3 = datetime.now()
-        if pending_count > 0:
-            df = llm_translate(df, glossary, str(workplace), sheet_name=sheet_name)
-        else:
-            print("    無需 LLM 翻譯")
-        elapsed(t3, "LLM 翻譯")
-
-        t4 = datetime.now()
-        timestamp("術語強制後處理...")
-        df, review_df = enforce(df, glossary, str(workplace),
-                                report_name=f"review_report_{sheet_name}.xlsx",
-                                write_report=False, sheet_name=sheet_name)
-        if not review_df.empty:
-            review_df.insert(0, "sheet_name", sheet_name)
-            all_review_rows.append(review_df)
-        elapsed(t4, "術語強制後處理")
-
-        df_full.update(df)
-        all_translated_dfs[sheet_name] = df_full
-
-        # 更新進度
-        pending_sheets.pop(0)
-        completed_sheets.append(sheet_name)
-        next_sheet = pending_sheets[0] if pending_sheets else ""
-        save_session(str(workplace), _build_session_data(
-            excel_path, glossary_path, glossary_sheets,
-            next_sheet, completed_sheets, pending_sheets, sheet_configs,
-            accumulated_review_rows=all_review_rows))
-        print(f"  ✅ {sheet_name} 完成")
-
-    # ── 所有工作表完成：寫入輸出 ──
     _write_outputs(excel_path, workplace, all_translated_dfs, all_review_rows, overall_start)
+
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except Exception as e:
         print(f"\n發生錯誤: {e}")
         import traceback

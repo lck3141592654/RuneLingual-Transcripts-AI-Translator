@@ -22,7 +22,6 @@ ADD_LIST: dict[str, str] = {
     "unranked Tournament": "非排位赛", "Old One": "古老者", "bank pin": "银行pin码", "Lady Lumbridge": "仑桥夫人号",
 }
 
-IGNORE_LIST: set[str] = set()
 IGNORE_LIST: set[str] = {"Toolkit", "Vial", "Bones", "Burnt bones", "Cup of tea", "Message", "Book"
                          , "Translation book", "Twigs", "Knife", "Plank", "Rock", "Chisel"
                          , "Barrel", "Cake", "Watch", "Chart", "Journal"
@@ -149,9 +148,6 @@ def auto_extract_glossary(
     - manual 工作表：sub_category ∈ {activity, location, quest, slayer_mob}
     - translation 不為空且不等於 english
     """
-    import pandas as pd
-    from pathlib import Path
-
     target_path = Path(target_excel_path)
     xls = pd.ExcelFile(target_path)
 

@@ -12,12 +12,13 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 25/6/2026, see [Changelog](Changelog.md) for details
-- **New space check**: Added a fourth layer to `scan_issues()` detecting six types of spacing issues (consecutive spaces, spaces between Chinese characters, space before/after Chinese/English punctuation). Displayed in green in review reports.
-- **New script preprocessing**: Applies mechanical fixes before each of the 3 LLM retranslation rounds, reducing API calls
-  - Single placeholder fix: when the source has exactly one `[]`, overwrites the translation's `[]` content with the source's
-  - Space fix: automatically removes six types of abnormal spaces while preserving legitimate ones
-- **Fixed false positive for placeholder-only entries**: Entries where removing all `[]` leaves only whitespace or punctuation are no longer flagged as untranslated
+## Latest Update on 7/8/2026, see [Changelog](Changelog.md) for details
+- **Multi-worksheet parallelism**: Both translation and proofreading now process all worksheets in parallel within each phase, with a phase barrier between phases
+- **Shared batch pool**: Added shared_pool.py - one set of API configs, concurrency and 429 state for the whole run; each API spawns parallel_limit workers
+- **Unified timeout constant**: Added API_TIMEOUT (default 3600s)
+- **429 disable threshold constant**: Added PERMANENT_DISABLE_AFTER (default 2)
+- **Atomic checkpoint writes**: All checkpoints now use .tmp -> fsync -> rename atomic writes
+- **Four-color review report**: The merged review report now colors space issues green
 
 ### Features
 
@@ -25,6 +26,7 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 - **Enforced terminology accuracy**: With script assistance, AI achieves **99%+ accuracy** on proper nouns such as character names, locations, and item names. In contrast, tools like Gemini's Gem feature or Qwen's project feature still have a non-negligible rate of mistranslating proper nouns, even with well-crafted prompts.
 - **Interactive operation**: Supports selecting sheets and entry ranges
 - **Async concurrency**: Sends multiple API requests simultaneously, significantly reducing translation time
+- **Multi-worksheet parallelism**: All worksheets run concurrently within each phase, with phase-barrier synchronization; one shared API batch pool keeps 429 state consistent across the run
 - **Checkpoint resume**: If the translation is interrupted due to network issues or manual interruption (Ctrl+C), simply re-run the script to resume from where it left off — no need to start over
 - **Auto-review**: Four-layer checks (terminology / placeholders / untranslated / spacing), generates a color-coded review report
 - **Multi-API support**: Supports using multiple API keys simultaneously (main/fallback classification), round-robin task distribution, automatic 429 rate-limit handling (cooldown/permanent disable), maximizing translation throughput
@@ -42,6 +44,7 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 | `tm_matcher.py` | Template matching (**not yet enabled**, will be added in the official release) |
 | `llm_translator.py` | **AI batch translation core**, async parallel calls, with smart JSON extraction and json_repair fallback |
 | enforcer.py | **Four-layer enforcement** (terminology/placeholders/untranslated/spacing), with script preprocessing, auto-correction + color-coded review report |
+| `shared_pool.py` | **Shared batch pool** - one set of API configs, concurrency and 429 state for the whole run |
 | `api_config.py` | Multi-API configuration parser, supports main/fallback classification, category-level default concurrency, per-API overrides |
 | `.env` | API configuration file, supports multi-API numbered format and legacy single-API format |
 | `.env.example` | Configuration template |
@@ -61,15 +64,15 @@ Main Translation Script
 batch_translate.py → executes in order:
 ① glossary.py      Load terminology database
 ② tm_matcher.py    Template parameter matching ⚠️ Not yet enabled, will be added in official release
-③ llm_translator.py AI batch translation (async parallel)
-④ enforcer.py      Four-layer enforcement + script preprocessing + retranslation + checkpoint resume + color-coded review report
+③ llm_translator.py AI batch translation (all worksheets in parallel)
+④ enforcer.py      Four-layer enforcement + script preprocessing + retranslation (all worksheets in parallel)
 ```
 ```
 Proofreading Script
-batch_proofread.py → processes each worksheet:
-① Phase 2: LLM Dual-round Evaluation (mixed R1+R2 batch pool)
-② Phase 3: LLM Polish (up to 3 rounds)
-③ Phase 4a: Retranslation Protection
+batch_proofread.py → multiple worksheets in parallel (phase barrier):
+① Phase 2: LLM Dual-round Evaluation (all worksheets in parallel)
+② Phase 3: LLM Polish (up to 3 rounds, all worksheets in parallel)
+③ Phase 4a: Retranslation Protection (all worksheets in parallel)
 ④ Phase 4b: Template Correction (executed after all worksheets)
 ⑤ Generate Reports
 ```
@@ -159,7 +162,7 @@ All output files are placed under the `workplace/` directory:
 
 ### Usage: Proofreading
 Place the translated Excel into `workplace/` and run `batch_proofread.py`.
-> ⚠️ **Note**: The proofreading pipeline currently only supports **single worksheet** processing.
+> ⚠️ **Note**: The proofreading pipeline supports **multiple worksheets** (all sheets run concurrently within each phase, with a phase barrier between phases).
 
 ### Interactive Steps (Proofreading)
 
@@ -276,6 +279,8 @@ The following constants are located in `api_config.py` and `llm_translator.py`. 
 | `MAIN_DEFAULT_LIMIT` | 10 | Main API default concurrency (api_config.py) |
 | `FALLBACK_DEFAULT_LIMIT` | 1 | Fallback API default concurrency (api_config.py) |
 | `REQUEST_INTERVAL` | 1 | Interval in seconds between requests from the same API (api_config.py) |
+| `API_TIMEOUT` | 3600 | Unified timeout in seconds for all LLM requests (api_config.py) |
+| `PERMANENT_DISABLE_AFTER` | 2 | Permanently disable an API after the Nth 429 (api_config.py) |
 
 > When adjusting concurrency: you can set `APIx_PARALLEL_LIMIT` in `.env` for individual APIs, or modify the category defaults in `api_config.py`. Setting it too high may trigger API endpoint rate limits. The defaults of main=10 and fallback=1 have been tested as the optimal balance point.
 
@@ -314,7 +319,7 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 ### API Related
 
 **Q: After running, `ImportError: No module named 'openai'` appears**
-<br>A: Dependencies not installed. Run `pip install openai pandas openpyxl python-dotenv`.
+<br>A: Dependencies not installed. Run `pip install openai pandas openpyxl python-dotenv json-repair`.
 
 **Q: `ValueError: Please set the API_KEY environment variable or set it in the .env file` appears**
 <br>A: You forgot to create the `.env` file. Copy `.env.example` to `.env` and fill in your API Key.
@@ -381,7 +386,7 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 <br>A: Type1 refers to terminology/placeholder/untranslated issues that can be automatically detected by scripts, marked with background colors. Type2 refers to fluency issues found by LLM dual-round evaluation — entries judged acceptable in both rounds are skipped.
 
 **Q: Can proofreading handle multiple worksheets?**
-<br>A: Currently only supports single worksheet processing. For multiple worksheets, run the proofreading script for each worksheet separately.
+<br>A: Yes. Proofreading processes multiple worksheets concurrently within each phase, with a phase barrier between phases.
 
 ---
 

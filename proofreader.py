@@ -7,24 +7,20 @@ from pathlib import Path
 from datetime import datetime
 from copy import deepcopy
 import pandas as pd
-from openai import AsyncOpenAI
-
 sys.path.insert(0, str(Path(__file__).parent))
 
-from glossary import load_glossary, auto_extract_glossary, normalize_term
+from glossary import load_glossary, auto_extract_glossary
 from tm_matcher import match_and_fill
 from llm_translator import (
-    _group_into_batches, BATCH_SIZE_LIMIT, _sanitize_sheet_name,
-    save_backup_part, load_backup, save_progress, load_progress, sync_progress,
+    _group_into_batches, _sanitize_sheet_name,
+    save_backup_part, sync_progress, atomic_write_text,
     get_relevant_glossary,
-    run_worker_pool,
 )
 from enforcer import (
-    check_glossary_usage, check_placeholder, check_untranslated,
     scan_issues, _enforce_async,
 )
-from enforcer import enforce as enforcer_enforce
-from api_config import load_api_configs, ApiConfig, REQUEST_INTERVAL
+from api_config import API_TIMEOUT
+from shared_pool import SharedBatchPool
 
 # Constants
 CHECKPOINT_SUBDIR = "_proofread_checkpoint"
@@ -77,7 +73,7 @@ def _mark_phase_complete(output_dir, sheet_name, phase):
     cd = _proofread_checkpoint_dir(output_dir, sheet_name)
     cd.mkdir(parents=True, exist_ok=True)
     marker = cd / f"_{phase}_done"
-    marker.write_text(json.dumps({ "phase": phase, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S") }, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(marker, json.dumps({ "phase": phase, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S") }, ensure_ascii=False))
 
 def _is_phase_complete(output_dir, sheet_name, phase):
     marker = _proofread_checkpoint_dir(output_dir, sheet_name) / f"_{phase}_done"
@@ -87,25 +83,10 @@ def _is_phase_complete(output_dir, sheet_name, phase):
 # === Phase 4b: Template Correction ===
 TEMPLATE_CHECKPOINT_FILE = "template_indices.json"
 
-def _template_checkpoint_exists(output_dir, sheet_name):
-    fp = _proofread_checkpoint_dir(output_dir, sheet_name) / TEMPLATE_CHECKPOINT_FILE
-    return fp.exists()
-
 def _save_template_checkpoint(output_dir, sheet_name, indices):
     cd = _proofread_checkpoint_dir(output_dir, sheet_name)
     cd.mkdir(parents=True, exist_ok=True)
-    (cd / TEMPLATE_CHECKPOINT_FILE).write_text(
-        json.dumps({"template_indices": indices}, ensure_ascii=False), encoding="utf-8")
-
-def _load_template_checkpoint(output_dir, sheet_name):
-    fp = _proofread_checkpoint_dir(output_dir, sheet_name) / TEMPLATE_CHECKPOINT_FILE
-    if fp.exists():
-        try:
-            data = json.loads(fp.read_text(encoding="utf-8"))
-            return data.get("template_indices", [])
-        except Exception:
-            pass
-    return []
+    atomic_write_text(cd / TEMPLATE_CHECKPOINT_FILE, json.dumps({"template_indices": indices}, ensure_ascii=False))
 
 def template_correction(df, glossary, output_dir, sheet_name=None):
     df = match_and_fill(df, glossary)
@@ -146,6 +127,7 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
         for item in batch
     ], ensure_ascii=False)
 
+    text = ""
     for attempt in range(3):
         try:
             resp = await client.chat.completions.create(
@@ -156,7 +138,7 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
                 ],
 
                 temperature=0.1,
-                timeout=3600,
+                timeout=API_TIMEOUT,
             )
             text = resp.choices[0].message.content.strip()
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
@@ -206,7 +188,6 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
             if isinstance(results, list):
                 results = results[:len(batch)]
                 for res, item in zip(results, batch):
-                    idx = res.get("index")
                     res["index"] = item.get("_idx", 0)
             if isinstance(results, dict):
                 results = [results]
@@ -249,7 +230,6 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
                     if isinstance(results, list):
                         results = results[:len(batch)]
                         for res, item in zip(results, batch):
-                            idx = res.get("index")
                             res["index"] = item.get("_idx", 0)
                         success_count = sum(1 for r in results if isinstance(r, dict) and r.get("level") and r.get("reason"))
                         rate = success_count / len(batch) if len(batch) > 0 else 0
@@ -285,10 +265,8 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
 def _save_phase2_results(output_dir, sheet_name, round1_results, round2_results):
     cd = _proofread_checkpoint_dir(output_dir, sheet_name)
     cd.mkdir(parents=True, exist_ok=True)
-    (cd / "phase2_round1.json").write_text(
-        json.dumps(round1_results, ensure_ascii=False), encoding="utf-8")
-    (cd / "phase2_round2.json").write_text(
-        json.dumps(round2_results, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(cd / "phase2_round1.json", json.dumps(round1_results, ensure_ascii=False))
+    atomic_write_text(cd / "phase2_round2.json", json.dumps(round2_results, ensure_ascii=False))
     _mark_phase_complete(output_dir, sheet_name, "phase2")
 
 
@@ -320,7 +298,7 @@ def _load_phase2_category(output_dir, sheet_name, df):
     return result
 
 
-async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None):
+async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=None):
     pending = []
     for idx, row in df.iterrows():
         trans = row.get("translation")
@@ -341,13 +319,8 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None):
     batches = _group_into_batches(pending)
     total_items = len(pending)
     print(f"  P2：{total_items} 條待評估，共 {len(batches)} 批")
-    api_configs = load_api_configs()
-    if not api_configs:
-        print("  錯誤：沒有 API 設定")
-        return df, []
-    active = [c for c in api_configs if not c.is_permanently_disabled]
-    if not active:
-        print("  錯誤：所有 API 已停用")
+    if pool is None:
+        print("  錯誤：沒有可用的共享 API 池")
         return df, []
     rr1 = {}
     rr2 = {}
@@ -360,61 +333,51 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None):
         all_tasks.append((bn, 1, batch))  # (orig_bn, round, data)
         all_tasks.append((bn, 2, batch))
 
-    async def process_batch(ws, flat_bn, task, rq):
-        orig_bn, rnd, batch = task
+    async def process_batch(ws, job):
+        orig_bn, rnd, batch = job.ctx
         cfg = ws["cfg"]
-        async with ws["rate_lock"]:
-            now = time.monotonic()
-            gap = REQUEST_INTERVAL - (now - ws["last_request"])
-            if gap > 0:
-                await asyncio.sleep(gap)
-            ws["last_request"] = time.monotonic()
-        async with ws["sem"]:
-            _timestamp(f"P2-R{rnd} 批次 {orig_bn}/{total_batches} 開始 ({len(batch)} 條) [{cfg.api_id} {cfg.model}]")
-            try:
-                results = await _evaluate_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
-                results = results[:len(batch)]
-                success_count = sum(1 for r in results if isinstance(r, dict) and r.get("level") and r.get("reason"))
-                rr = rr1 if rnd == 1 else rr2
-                for res in results:
-                    idx = res.get("index")
-                    if idx is not None:
-                        rr[str(idx)] = {"index": idx, "level": res.get("level", "没问题"), "reason": res.get("reason", "")}
-                part_data = {}
-                for res2 in results:
-                    idx2 = res2.get("index")
-                    if idx2 is not None:
-                        part_data[str(idx2)] = {"index": idx2, "level": res2.get("level", "没问题"), "reason": res2.get("reason", "")}
-                if part_data:
-                    cd2 = _proofread_checkpoint_dir(output_dir, sheet_name)
-                    cd2.mkdir(parents=True, exist_ok=True)
-                    (cd2 / f"{tag}_{orig_bn:06d}_r{rnd}.json").write_text(
-                        json.dumps(part_data, ensure_ascii=False), encoding="utf-8")
-                    sync_progress(output_dir, sheet_name)
-                _timestamp(f"P2-R{rnd} 批次 {orig_bn}/{total_batches} 完成 ({success_count} 條) [{cfg.api_id} {cfg.model}]")
-            except Exception as e:
-                es = str(e).lower()
-                if "429" in es or "rate" in es:
-                    cfg.mark_429()
-                    if cfg.is_permanently_disabled:
-                        print(f"  [{cfg.api_id}] 429，永久停用")
-                    else:
-                        retries = getattr(cfg, '_429_retries', 0) + 1
-                        cfg._429_retries = retries
-                        print(f"  [{cfg.api_id}] 429，冷卻 60 秒 (retry #{retries})")
-                    rq.put_nowait((flat_bn, task))
+        _timestamp(f"P2-R{rnd} 批次 {orig_bn}/{total_batches} 開始 ({len(batch)} 條) [{cfg.api_id} {cfg.model}]")
+        try:
+            results = await _evaluate_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
+            results = results[:len(batch)]
+            success_count = sum(1 for r in results if isinstance(r, dict) and r.get("level") and r.get("reason"))
+            rr = rr1 if rnd == 1 else rr2
+            for res in results:
+                idx = res.get("index")
+                if idx is not None:
+                    rr[str(idx)] = {"index": idx, "level": res.get("level", "没问题"), "reason": res.get("reason", "")}
+            part_data = {}
+            for res2 in results:
+                idx2 = res2.get("index")
+                if idx2 is not None:
+                    part_data[str(idx2)] = {"index": idx2, "level": res2.get("level", "没问题"), "reason": res2.get("reason", "")}
+            if part_data:
+                cd2 = _proofread_checkpoint_dir(output_dir, sheet_name)
+                cd2.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(cd2 / f"{tag}_{orig_bn:06d}_r{rnd}.json", json.dumps(part_data, ensure_ascii=False))
+                sync_progress(output_dir, sheet_name)
+            _timestamp(f"P2-R{rnd} 批次 {orig_bn}/{total_batches} 完成 ({success_count} 條) [{cfg.api_id} {cfg.model}]")
+        except Exception as e:
+            es = str(e).lower()
+            if "429" in es or "rate" in es:
+                cfg.mark_429()
+                if cfg.is_permanently_disabled:
+                    print(f"  [{cfg.api_id}] 429，永久停用")
                 else:
-                    print(f"  [{cfg.api_id}] 錯誤：{e}")
-                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                        try:
-                            print(f"    回應: {e.response.text[:500]}")
-                        except Exception:
-                            pass
-            finally:
-                ws["active_count"] -= 1
+                    retries = getattr(cfg, "_429_retries", 0) + 1
+                    cfg._429_retries = retries
+                    print(f"  [{cfg.api_id}] 429，冷卻 60 秒 (retry #{retries})")
+                pool.retry(job)
+            else:
+                print(f"  [{cfg.api_id}] 錯誤：{e}")
+                if hasattr(e, "response") and hasattr(e.response, "text"):
+                    try:
+                        print(f"    回應: {e.response.text[:500]}")
+                    except Exception:
+                        pass
 
     try:
-        await run_worker_pool(active, all_tasks, process_batch)
+        await asyncio.gather(*[pool.submit(fbn, task, process_batch) for fbn, task in enumerate(all_tasks, 1)])
     except RuntimeError as e:
         if "all APIs permanently disabled" in str(e):
             print("  ⚠️ 所有 API 已永久停用，Phase 2 評估中斷")
@@ -471,6 +434,7 @@ async def _polish_batch(client, model, batch, glossary, api_id):
         {"index": item["_idx"], "english": item.get("english", "")}
         for item in batch
     ], ensure_ascii=False)
+    text = ""
     for attempt in range(3):
         try:
             resp = await client.chat.completions.create(
@@ -481,7 +445,7 @@ async def _polish_batch(client, model, batch, glossary, api_id):
                 ],
 
                 temperature=0.1,
-                timeout=3600,
+                timeout=API_TIMEOUT,
             )
             text = resp.choices[0].message.content.strip()
             text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
@@ -524,7 +488,6 @@ async def _polish_batch(client, model, batch, glossary, api_id):
             if isinstance(results, list):
                 results = results[:len(batch)]
                 for res, item in zip(results, batch):
-                    idx = res.get("index")
                     res["index"] = item.get("_idx", 0)
             if isinstance(results, dict):
                 results = [results]
@@ -561,7 +524,6 @@ async def _polish_batch(client, model, batch, glossary, api_id):
                     if isinstance(results, list):
                         results = results[:len(batch)]
                         for res, item in zip(results, batch):
-                            idx = res.get("index")
                             res["index"] = item.get("_idx", 0)
                         success = sum(1 for r in results if isinstance(r, dict) and r.get("translation"))
                         rate = success / len(batch) if len(batch) > 0 else 0
@@ -595,8 +557,7 @@ async def _polish_batch(client, model, batch, glossary, api_id):
 def _save_polish_checkpoint(output_dir, sheet_name, backup_data):
     cd = _proofread_checkpoint_dir(output_dir, sheet_name)
     cd.mkdir(parents=True, exist_ok=True)
-    (cd / "polish_results.json").write_text(
-        json.dumps(backup_data, ensure_ascii=False), encoding="utf-8")
+    atomic_write_text(cd / "polish_results.json", json.dumps(backup_data, ensure_ascii=False))
     _mark_phase_complete(output_dir, sheet_name, "polish")
 
 
@@ -615,16 +576,15 @@ def _apply_polish_from_checkpoint(df, output_dir, sheet_name):
     return df
 
 
-async def polish_translations(df, second_category, glossary, output_dir, sheet_name=None):
+async def polish_translations(df, second_category, glossary, output_dir, sheet_name=None, pool=None):
     all_indices = set()
     for item in second_category:
         all_indices.add(item["index"])
     if not all_indices:
         return df
 
-    api_configs = load_api_configs()
-    if not api_configs:
-        print("  错误：没有 API 设定")
+    if pool is None:
+        print("  错误：没有可用的共享 API 池")
         return df
 
     MAX_ROUNDS = 3
@@ -653,61 +613,49 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
         batches = _group_into_batches(pending)
         print(f"  P3 第 {rnd + 1}/{MAX_ROUNDS} 轮：{len(pending)} 条待润色，共 {len(batches)} 批")
 
-        active = [c for c in api_configs if not c.is_permanently_disabled]
-        if not active:
-            print("  错误：所有 API 已永久停用")
-            break
         tag = uuid.uuid4().hex[:8]
         all_backup = {}
         total_batches = len(batches)
 
-        async def process_batch(ws, bn, batch, rq):
+        async def process_batch(ws, job):
             cfg = ws["cfg"]
-            async with ws["rate_lock"]:
-                now = time.monotonic()
-                gap = REQUEST_INTERVAL - (now - ws["last_request"])
-                if gap > 0:
-                    await asyncio.sleep(gap)
-                ws["last_request"] = time.monotonic()
-            async with ws["sem"]:
-                _timestamp(f"P3 批次 {bn}/{total_batches} 开始 ({len(batch)} 条) [{cfg.api_id} {cfg.model}]")
-                try:
-                    results = await _polish_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
-                    new_backup = {}
-                    for res in results:
-                        idx = res.get("index")
-                        trans = res.get("translation")
-                        if idx is not None and trans is not None:
-                            df.at[idx, "translation"] = trans
-                            new_backup[str(idx)] = str(trans)
-                            all_backup[str(idx)] = str(trans)
-                    if new_backup:
-                        save_backup_part(output_dir, tag, bn, new_backup, sheet_name)
-                        sync_progress(output_dir, sheet_name)
-                    _timestamp(f"P3 批次 {bn}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
-                except Exception as e:
-                    es = str(e).lower()
-                    if "429" in es or "rate" in es:
-                        cfg.mark_429()
-                        if cfg.is_permanently_disabled:
-                            print(f"  [{cfg.api_id}] 429，永久停用")
-                        else:
-                            retries = getattr(cfg, '_429_retries', 0) + 1
-                            cfg._429_retries = retries
-                            print(f"  [{cfg.api_id}] 429，冷却 60 秒 (retry #{retries})")
-                        rq.put_nowait((bn, batch))
+            bn, batch = job.batch_num, job.batch
+            _timestamp(f"P3 批次 {bn}/{total_batches} 开始 ({len(batch)} 条) [{cfg.api_id} {cfg.model}]")
+            try:
+                results = await _polish_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
+                new_backup = {}
+                for res in results:
+                    idx = res.get("index")
+                    trans = res.get("translation")
+                    if idx is not None and trans is not None:
+                        df.at[idx, "translation"] = trans
+                        new_backup[str(idx)] = str(trans)
+                        all_backup[str(idx)] = str(trans)
+                if new_backup:
+                    save_backup_part(output_dir, tag, bn, new_backup, sheet_name)
+                    sync_progress(output_dir, sheet_name)
+                _timestamp(f"P3 批次 {bn}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
+            except Exception as e:
+                es = str(e).lower()
+                if "429" in es or "rate" in es:
+                    cfg.mark_429()
+                    if cfg.is_permanently_disabled:
+                        print(f"  [{cfg.api_id}] 429，永久停用")
                     else:
-                        print(f"  [{cfg.api_id}] 错误：{e}")
-                        if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                            try:
-                                print(f"    回应: {e.response.text[:500]}")
-                            except Exception:
-                                pass
-                finally:
-                    ws["active_count"] -= 1
+                        retries = getattr(cfg, "_429_retries", 0) + 1
+                        cfg._429_retries = retries
+                        print(f"  [{cfg.api_id}] 429，冷卻 60 秒 (retry #{retries})")
+                    pool.retry(job)
+                else:
+                    print(f"  [{cfg.api_id}] 错误：{e}")
+                    if hasattr(e, "response") and hasattr(e.response, "text"):
+                        try:
+                            print(f"    回应: {e.response.text[:500]}")
+                        except Exception:
+                            pass
 
         try:
-            await run_worker_pool(active, list(batches), process_batch)
+            await asyncio.gather(*[pool.submit(bn, b, process_batch) for bn, b in enumerate(batches, 1)])
         except RuntimeError as e:
             if "all APIs permanently disabled" in str(e):
                 print("  ⚠️ 所有 API 已永久停用，Phase 3 润色中断")
@@ -779,7 +727,7 @@ def _save_debug_info(api_id, model, batch_size, returned, success, text):
 
 
 # === Phase 4: Retry Protect ===
-async def retry_protect(df, glossary, output_dir, sheet_name=None):
+async def retry_protect(df, glossary, output_dir, sheet_name=None, pool=None):
     import re
     import pandas as pd
     # Compute relevant glossary (same logic as enforcer.enforce())
@@ -789,10 +737,9 @@ async def retry_protect(df, glossary, output_dir, sheet_name=None):
         if re.search(r"(?<![a-z'])" + re.escape(e.lower()) + r"(?![a-z'])", all_text)
     }
     glossary_text = chr(10).join([f"  {e} → {c}" for e, c in relevant_glossary.items()]) if relevant_glossary else "  无"
-    # Run retry directly in current event loop (no more nested asyncio.run())
-    api_configs = load_api_configs()
-    if api_configs:
-        df = await _enforce_async(df, relevant_glossary, glossary_text, output_dir=output_dir, sheet_name=sheet_name)
+    # Run retry directly in current event loop with the shared pool
+    if pool is not None:
+        df = await _enforce_async(df, relevant_glossary, glossary_text, output_dir=output_dir, sheet_name=sheet_name, shared_pool=pool)
     # Final scan (same as enforcer.enforce())
     final_pool = scan_issues(df, relevant_glossary)
     review_rows = []
@@ -825,7 +772,7 @@ def backup_target_file(excel_path):
 
 
 def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_second_category, all_review_rows, output_dir, overall_start):
-    from openpyxl.styles import PatternFill
+    from openpyxl.styles import Color, PatternFill
     out_path = Path(output_dir) / f"{Path(excel_path).stem}_proofread_output.xlsx"
     if all_translated_dfs:
         with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
@@ -854,16 +801,15 @@ def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_secon
             ws = writer.sheets["Sheet1"]
             # Type1: 背景顏色標記（標註問題類型）
             type1_fills = {
-                "glossary": PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid"),
-                "placeholder": PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid"),
-                "untranslated": PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid"),
+                "glossary": PatternFill(start_color=Color(rgb="D9D9D9"), end_color=Color(rgb="D9D9D9"), fill_type="solid"),
+                "placeholder": PatternFill(start_color=Color(rgb="BDD7EE"), end_color=Color(rgb="BDD7EE"), fill_type="solid"),
+                "untranslated": PatternFill(start_color=Color(rgb="F4CCCC"), end_color=Color(rgb="F4CCCC"), fill_type="solid"),
             }
             # Type2: 文字顏色標記（Type2-R1 部分藍字，其餘黑字）
-            from openpyxl.cell.cell import CellRichText
+            from openpyxl.cell.rich_text import CellRichText, TextBlock
             from openpyxl.cell.text import InlineFont
-            from openpyxl.cell.rich_text import TextBlock
-            f_blue = InlineFont(sz=11, color="FF0070C0")
-            f_black = InlineFont(sz=11, color="FF000000")
+            f_blue = InlineFont(sz=11, color=Color(rgb="FF0070C0"))
+            f_black = InlineFont(sz=11, color=Color(rgb="FF000000"))
             remark_col = None
             for ci, cell in enumerate(ws[1], start=1):
                 if cell.value == "remark":
@@ -893,11 +839,11 @@ def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_secon
         with pd.ExcelWriter(rvp, engine="openpyxl") as writer:
             combined.to_excel(writer, index=False, sheet_name="Sheet1")
             ws = writer.sheets["Sheet1"]
-            fg = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-            fp = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-            fu = PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
+            fg = PatternFill(start_color=Color(rgb="D9D9D9"), end_color=Color(rgb="D9D9D9"), fill_type="solid")
+            fp = PatternFill(start_color=Color(rgb="BDD7EE"), end_color=Color(rgb="BDD7EE"), fill_type="solid")
+            fu = PatternFill(start_color=Color(rgb="F4CCCC"), end_color=Color(rgb="F4CCCC"), fill_type="solid")
             ic = None
-            fs = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+            fs = PatternFill(start_color=Color(rgb="E2EFDA"), end_color=Color(rgb="E2EFDA"), fill_type="solid")
             for ci, cell in enumerate(ws[1], start=1):
                 if cell.value == "issue":
                     ic = ci; break
@@ -939,6 +885,37 @@ def _build_session_data(excel_path, glossary_path, glossary_sheets, current_shee
     return session
 
 
+async def _proofread_phase2(sheet_name, st, glossary, workplace_str, pool):
+    df = st["df"]
+    _timestamp(f"P2 開始：{sheet_name}...")
+    if _is_phase_complete(workplace_str, sheet_name, "phase2"):
+        sc = _load_phase2_category(workplace_str, sheet_name, df)
+        print(f"    P2 還原：{len(sc)} 條第二類問題")
+    else:
+        df, sc = await phase2_llm_evaluate(df, glossary, workplace_str, sheet_name=sheet_name, pool=pool)
+    st["df"] = df
+    st["sc"] = sc
+
+
+async def _proofread_phase3(sheet_name, st, glossary, workplace_str, pool):
+    df = st["df"]
+    sc = st["sc"]
+    _timestamp(f"P3 開始：{sheet_name}...")
+    if _is_phase_complete(workplace_str, sheet_name, "polish"):
+        df = _apply_polish_from_checkpoint(df, workplace_str, sheet_name)
+    else:
+        df = await polish_translations(df, sc, glossary, workplace_str, sheet_name=sheet_name, pool=pool)
+    st["df"] = df
+
+
+async def _proofread_phase4a(sheet_name, st, glossary, workplace_str, pool):
+    df = st["df"]
+    _timestamp(f"P4a 開始：{sheet_name}...")
+    df, review_df = await retry_protect(df, glossary, workplace_str, sheet_name=sheet_name, pool=pool)
+    st["df"] = df
+    st["review_df"] = review_df
+
+
 async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names, sheet_configs):
     overall_start = datetime.now()
     workplace = Path(excel_path).parent
@@ -962,86 +939,107 @@ async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names,
         excel_path, glossary_path, glossary_sheets,
         pending_sheets[0] if pending_sheets else "",
         [], pending_sheets, sheet_configs))
-    while pending_sheets:
-        sheet_name = pending_sheets[0]
-        print(f"\n{chr(61)*60}")
-        print(f"  正在處理工作表：{sheet_name}")
-        print(f"{chr(61)*60}")
-        if _is_phase_complete(str(workplace), sheet_name, "all"):
+    # Phase barrier: all sheets run each phase in parallel through the shared pool.
+    pool = SharedBatchPool()
+    await pool.start()
+    active = [c for c in pool.api_configs if not c.is_permanently_disabled]
+    print(f"  已載入 {len(active)} 個可用 API：")
+    for cfg in active:
+        print(f"    {cfg.api_id} {cfg.model_provider}/{cfg.model} ({cfg.api_type}, 並發={cfg.parallel_limit})")
+
+    try:
+        # Pre-read all worksheets
+        sheet_states = {}
+        for sheet_name in pending_sheets:
             df_original = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
             all_original_dfs[sheet_name] = df_original
+            print(f"    總行數：{len(df_original)}")
             sheet_cfg = sheet_configs.get(sheet_name, {})
             selected_indices = set(sheet_cfg.get("selected_indices", []))
+            if _is_phase_complete(str(workplace), sheet_name, "all"):
+                if not selected_indices:
+                    all_translated_dfs[sheet_name] = df_original
+                else:
+                    df = df_original[df_original.index.isin(selected_indices)].copy()
+                    df = _apply_polish_from_checkpoint(df, str(workplace), sheet_name)
+                    df, review_df = await retry_protect(df, glossary, str(workplace), sheet_name=sheet_name, pool=pool)
+                    if not review_df.empty:
+                        review_df.insert(0, "sheet_name", sheet_name)
+                        all_review_rows.append(review_df)
+                    df_original.update(df)
+                    all_translated_dfs[sheet_name] = df_original
+                    sc = _load_phase2_category(str(workplace), sheet_name, df)
+                    all_second_category[sheet_name] = sc
+                completed_sheets.append(sheet_name)
+                print(f"  已從 checkpoint 還原 {sheet_name}")
+                continue
             if not selected_indices:
+                print(f"  {sheet_name} 未選取任何條目，跳過")
                 all_translated_dfs[sheet_name] = df_original
-            else:
-                df = df_original[df_original.index.isin(selected_indices)].copy()
-                df = _apply_polish_from_checkpoint(df, str(workplace), sheet_name)
-                df, review_df = await retry_protect(df, glossary, str(workplace), sheet_name=sheet_name)
-                if not review_df.empty:
-                    review_df.insert(0, "sheet_name", sheet_name)
-                    all_review_rows.append(review_df)
-                df_original.update(df)
-                all_translated_dfs[sheet_name] = df_original
-                sc = _load_phase2_category(str(workplace), sheet_name, df)
-                all_second_category[sheet_name] = sc
-            pending_sheets.pop(0); completed_sheets.append(sheet_name)
-            _save_session(str(workplace), _build_session_data(
-                excel_path, glossary_path, glossary_sheets,
-                pending_sheets[0] if pending_sheets else "",
-                completed_sheets, pending_sheets, sheet_configs))
-            print(f"  已從 checkpoint 還原 {sheet_name}")
-            continue
-        t1 = datetime.now()
-        _timestamp(f"正在讀取 {sheet_name}...")
-        df_original = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
-        all_original_dfs[sheet_name] = df_original
-        print(f"    總行數：{len(df_original)}")
-        sheet_cfg = sheet_configs.get(sheet_name, {})
-        selected_indices = set(sheet_cfg.get("selected_indices", []))
-        if not selected_indices:
-            print(f"  {sheet_name} 未選取任何條目，跳過")
-            all_translated_dfs[sheet_name] = df_original
-            pending_sheets.pop(0); completed_sheets.append(sheet_name)
-            continue
-        mask = df_original.index.isin(selected_indices)
-        df = df_original[mask].copy()
+                completed_sheets.append(sheet_name)
+                continue
+            mask = df_original.index.isin(selected_indices)
+            df = df_original[mask].copy()
+            sheet_states[sheet_name] = {
+                "df_original": df_original, "df": df, "sc": [], "review_df": None,
+            }
+
+        # Phase 2: LLM dual-round evaluation (all sheets in parallel)
         t4 = datetime.now()
-        _timestamp("Phase 2：LLM 評估...")
-        if _is_phase_complete(str(workplace), sheet_name, "phase2"):
-            sc = _load_phase2_category(str(workplace), sheet_name, df)
-            print(f"    P2 還原：{len(sc)} 條第二類問題")
-        else:
-            df, sc = await phase2_llm_evaluate(df, glossary, str(workplace), sheet_name=sheet_name)
-        all_second_category[sheet_name] = sc
+        _timestamp("Phase 2：LLM 評估（全部工作表並行）...")
+        await asyncio.gather(*[
+            _proofread_phase2(sheet_name, st, glossary, str(workplace), pool)
+            for sheet_name, st in sheet_states.items()
+        ])
         elapsed(t4, "P2")
+
+        # Phase 3: LLM polish (all sheets in parallel)
         t5 = datetime.now()
-        _timestamp("Phase 3：潤色...")
-        if _is_phase_complete(str(workplace), sheet_name, "polish"):
-            df = _apply_polish_from_checkpoint(df, str(workplace), sheet_name)
-        else:
-            df = await polish_translations(df, sc, glossary, str(workplace), sheet_name=sheet_name)
+        _timestamp("Phase 3：潤色（全部工作表並行）...")
+        await asyncio.gather(*[
+            _proofread_phase3(sheet_name, st, glossary, str(workplace), pool)
+            for sheet_name, st in sheet_states.items()
+        ])
         elapsed(t5, "P3")
+
+        # Phase 4a: retry protect (all sheets in parallel)
         t6 = datetime.now()
-        _timestamp("Phase 4a：重譯保護...")
-        df, review_df = await retry_protect(df, glossary, str(workplace), sheet_name=sheet_name)
-        if not review_df.empty:
-            review_df.insert(0, "sheet_name", sheet_name)
-            all_review_rows.append(review_df)
+        _timestamp("Phase 4a：重譯保護（全部工作表並行）...")
+        results = await asyncio.gather(*[
+            _proofread_phase4a(sheet_name, st, glossary, str(workplace), pool)
+            for sheet_name, st in sheet_states.items()
+        ], return_exceptions=True)
+        for sheet_name, res in zip(sheet_states, results):
+            if isinstance(res, BaseException):
+                if isinstance(res, RuntimeError) and "all APIs permanently disabled" in str(res):
+                    print("\n  ⚠️所有 API 已永久停用，校對中止")
+                raise res
         elapsed(t6, "P4a")
-        # Clean up enforcer checkpoint (it uses _checkpoint/ directory)
-        ecp = Path(str(workplace)) / "_checkpoint" / _sanitize_sheet_name(sheet_name) / "enforce_checkpoint.json"
-        if ecp.exists(): ecp.unlink()
-        df_original.update(df)
-        all_translated_dfs[sheet_name] = df_original
-        _mark_phase_complete(str(workplace), sheet_name, "all")
-        pending_sheets.pop(0); completed_sheets.append(sheet_name)
-        next_sheet = pending_sheets[0] if pending_sheets else ""
+
+        # Merge results
+        for sheet_name, st in sheet_states.items():
+            df = st["df"]
+            all_second_category[sheet_name] = st["sc"]
+            review_df = st["review_df"]
+            if review_df is not None and not review_df.empty:
+                review_df.insert(0, "sheet_name", sheet_name)
+                all_review_rows.append(review_df)
+            ecp = Path(str(workplace)) / "_checkpoint" / _sanitize_sheet_name(sheet_name) / "enforce_checkpoint.json"
+            if ecp.exists():
+                ecp.unlink()
+            st["df_original"].update(df)
+            all_translated_dfs[sheet_name] = st["df_original"]
+            _mark_phase_complete(str(workplace), sheet_name, "all")
+            completed_sheets.append(sheet_name)
+            print(f"  {sheet_name} 完成")
+
+        pending_sheets.clear()
         _save_session(str(workplace), _build_session_data(
             excel_path, glossary_path, glossary_sheets,
-            next_sheet, completed_sheets, pending_sheets, sheet_configs,
+            "", completed_sheets, pending_sheets, sheet_configs,
             accumulated_review_rows=all_review_rows))
-        print(f"  {sheet_name} 完成")
+    finally:
+        await pool.close()
 
     # Phase 4b：模板校正（在所有重譯完成後執行）
     t_p4b = datetime.now()

@@ -1,11 +1,10 @@
-import json, time, os, re, asyncio, uuid
+import json, time, re, asyncio, uuid
 from pathlib import Path
 from datetime import datetime
-from openai import AsyncOpenAI
 import pandas as pd
 from dotenv import load_dotenv
 from glossary import normalize_term
-from api_config import load_api_configs, ApiConfig, REQUEST_INTERVAL
+from api_config import API_TIMEOUT
 
 load_dotenv()
 
@@ -84,14 +83,14 @@ def _checkpoint_dir(output_dir=None, sheet_name=None) -> Path:
 
 # ── 進度檔案 ──
 
-def load_progress(output_dir=None, sheet_name=None) -> dict:
-    p = _checkpoint_dir(output_dir, sheet_name) / PROGRESS_FILE
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"completed_count": 0, "completed_indices": []}
+def atomic_write_text(path: Path, content: str) -> None:
+    """原子寫入文字檔：.tmp → fsync → rename，避免中斷造成檔案損毀。"""
+    import os as _os
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    with open(tmp, "ab") as f:
+        _os.fsync(f.fileno())
+    tmp.replace(path)
 
 
 def save_progress(output_dir, completed_indices: list, sheet_name=None):
@@ -102,8 +101,7 @@ def save_progress(output_dir, completed_indices: list, sheet_name=None):
         "completed_indices": completed_indices,
         "last_saved": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
-    p = cd / PROGRESS_FILE
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(cd / PROGRESS_FILE, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 # ── Session 檔案 ──
@@ -111,23 +109,7 @@ def save_progress(output_dir, completed_indices: list, sheet_name=None):
 def save_session(output_dir, session_info: dict):
     cd = _checkpoint_dir(output_dir)
     cd.mkdir(parents=True, exist_ok=True)
-    import os as _os
-    tmp = cd / f"{SESSION_FILE}.tmp"
-    final = cd / SESSION_FILE
-    tmp.write_text(json.dumps(session_info, ensure_ascii=False, indent=2), encoding="utf-8")
-    with open(tmp, 'ab') as f:
-        _os.fsync(f.fileno())
-    tmp.replace(final)
-
-
-def load_session(output_dir=None) -> dict | None:
-    sf = _checkpoint_dir(output_dir) / SESSION_FILE
-    if sf.exists():
-        try:
-            return json.loads(sf.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return None
+    atomic_write_text(cd / SESSION_FILE, json.dumps(session_info, ensure_ascii=False, indent=2))
 
 
 # ── 備份：每批次獨立一個 part 檔案（UUID 避免覆蓋） ──
@@ -136,13 +118,7 @@ def save_backup_part(output_dir, session_tag: str, batch_num: int, batch_data: d
     """原子寫入單一批次的 part 檔案（強制同步磁碟後才 rename）"""
     cd = _checkpoint_dir(output_dir, sheet_name)
     cd.mkdir(parents=True, exist_ok=True)
-    import os as _os
-    tmp = cd / f"part_{session_tag}_{batch_num:06d}.tmp"
-    final = cd / f"part_{session_tag}_{batch_num:06d}.json"
-    tmp.write_text(json.dumps(batch_data, ensure_ascii=False), encoding="utf-8")
-    with open(tmp, 'ab') as f:
-        _os.fsync(f.fileno())
-    tmp.replace(final)
+    atomic_write_text(cd / f"part_{session_tag}_{batch_num:06d}.json", json.dumps(batch_data, ensure_ascii=False))
 
 
 def load_backup(output_dir=None, sheet_name=None) -> dict:
@@ -180,87 +156,6 @@ def delete_checkpoint_files(output_dir, sheet_name=None):
 
 # ── 通用 async worker pool ──
 
-async def run_worker_pool(
-    api_configs: list[ApiConfig],
-    batches: list[list[dict]],
-    process_func,
-) -> None:
-    """
-    通用 async worker pool，供翻譯/校對共用。
-
-    process_func(ws, batch_num, batch, retry_queue) -> None
-      - ws = {"cfg", "client", "sem", "rate_lock", "last_request", "active_count"}
-      - 正常完成時直接 return
-      - 429 時呼叫 retry_queue.put_nowait((batch_num, batch)) 放回重試
-
-    不需 checkpoint 參數，由 process_func 自行決定備份策略。
-    """
-    active_configs = [cfg for cfg in api_configs if not cfg.is_permanently_disabled]
-    if not active_configs:
-        print("  錯誤：所有 API 已永久停用")
-        return
-
-    queue: asyncio.Queue = asyncio.Queue()
-    for bi, batch in enumerate(batches):
-        queue.put_nowait((bi + 1, batch))
-
-    worker_states = []
-    for cfg in active_configs:
-        worker_states.append({
-            "cfg": cfg,
-            "client": AsyncOpenAI(api_key=cfg.key, base_url=cfg.base_url),
-            "sem": asyncio.Semaphore(cfg.parallel_limit),
-            "rate_lock": asyncio.Lock(),
-            "last_request": 0.0,
-            "active_count": 0,
-        })
-
-    all_tasks = []
-    round_robin_index = 0
-
-    while True:
-        all_tasks = [t for t in all_tasks if not t.done()]
-
-        if queue.empty() and all(ws["active_count"] == 0 for ws in worker_states):
-            break
-
-        available = []
-        for ws in worker_states:
-            cfg = ws["cfg"]
-            if cfg.is_cooling_down or cfg.is_permanently_disabled:
-                continue
-            if ws["active_count"] >= cfg.parallel_limit:
-                continue
-            available.append(ws)
-
-        if not available or queue.empty():
-            all_disabled = all(
-                ws["cfg"].is_permanently_disabled for ws in worker_states
-            )
-            if all_disabled and not queue.empty():
-                print(f"\n  ⚠️ 所有 API 已永久停用（兩次 429 限流），無法繼續翻譯")
-                print(f"  已儲存部分翻譯進度，請檢查 API Key 後重新執行即可續傳")
-                raise RuntimeError("all APIs permanently disabled")
-            await asyncio.sleep(0.2)
-            continue
-
-        for _ in range(len(available)):
-            ws = available[round_robin_index % len(available)]
-            round_robin_index = (round_robin_index + 1) % len(available)
-            try:
-                batch_num, batch = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-            ws["active_count"] += 1
-            task = asyncio.create_task(process_func(ws, batch_num, batch, queue))
-            all_tasks.append(task)
-
-    if all_tasks:
-        try:
-            await asyncio.gather(*all_tasks)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            raise
 
 # ── LLM API 調用 ──
 
@@ -276,6 +171,7 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
         for item in batch
     ], ensure_ascii=False)
 
+    text = ""
     for attempt in range(3):
         try:
             resp = await client.chat.completions.create(
@@ -286,7 +182,7 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                 ],
 
                 temperature=0.1,
-                timeout=3600,
+                timeout=API_TIMEOUT,
             )
             # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
             text = resp.choices[0].message.content.strip()
@@ -398,74 +294,84 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
     return [{"index": item["_idx"], "translation": None, "_error": "API failed"} for item in batch]
 
 
-# ── 非同步翻譯核心（多 API 共享隊列） ──
-async def _translate_all_async(df, glossary, output_dir, pending, sheet_name=None):
-    api_configs = load_api_configs()
-    if not api_configs:
-        print("  錯誤：沒有可用的 API 設定")
-        return df
+# ── 非同步翻譯核心（共享批次池） ──
+def prepare_sheet_translation(df: pd.DataFrame, output_dir=None, sheet_name=None):
+    # Restore already-translated entries from backup and build the pending list (local work).
+    df = df.copy()
+    backup = load_backup(output_dir, sheet_name)
+    if backup:
+        restore_count = 0
+        for idx_str, trans in backup.items():
+            idx = int(idx_str)
+            if idx in df.index and (pd.isna(df.at[idx, "translation"]) or df.at[idx, "translation"] is None):
+                df.at[idx, "translation"] = trans
+                restore_count += 1
+        if restore_count > 0:
+            print(f"  從備份還原 {restore_count} 條翻譯")
+    if "translation" not in df.columns:
+        df["translation"] = None
+    pending = []
+    for idx, row in df.iterrows():
+        if pd.isna(row.get("translation")) or row["translation"] is None:
+            pending.append({
+                "_idx": idx,
+                "english": str(row["english"]),
+                "sub_category": str(row.get("sub_category", "")),
+                "notes": row.get("notes"),
+                "wiki_url": row.get("wiki_url"),
+            })
+    if not pending:
+        print("  所有条目已完成，无需翻译")
+    pending.sort(key=lambda x: (x.get("sub_category", ""), x.get("_idx", 0)))
+    print(f"  待翻译: {len(pending)} 条")
+    return df, pending
 
-    active_configs = [cfg for cfg in api_configs if not cfg.is_permanently_disabled]
-    if not active_configs:
-        print("  錯誤：所有 API 已永久停用")
-        return df
 
-    print(f"  已載入 {len(active_configs)} 個可用 API：")
-    for cfg in active_configs:
-        print(f"    {cfg.api_id} {cfg.model_provider}/{cfg.model} ({cfg.api_type}, 並發={cfg.parallel_limit})")
-
+async def translate_sheet_phase(df, glossary, output_dir, pending, sheet_name, pool):
+    # Submit this worksheet translation batches to the shared pool and update df.
     batches = _group_into_batches(pending)
     total_batches = len(batches)
     session_tag = uuid.uuid4().hex[:8]
 
-    async def _process_batch(ws, batch_num, batch, retry_queue):
+    async def _process_batch(ws, job):
         cfg = ws["cfg"]
-        async with ws["rate_lock"]:
-            now = time.monotonic()
-            gap = REQUEST_INTERVAL - (now - ws["last_request"])
-            if gap > 0:
-                await asyncio.sleep(gap)
-            ws["last_request"] = time.monotonic()
-
-        async with ws["sem"]:
-            _timestamp(f"批次 {batch_num}/{total_batches} 開始 ({len(batch)} 条) [{cfg.api_id} {cfg.model}]")
-
-            try:
-                results = await _translate_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
-                new_backup = {}
-                for res in results:
-                    idx = res.get("index")
-                    trans = res.get("translation")
-                    if idx is not None and trans is not None:
-                        df.at[idx, "translation"] = trans
-                        new_backup[str(idx)] = str(trans)
-                if new_backup:
-                    save_backup_part(output_dir, session_tag, batch_num, new_backup, sheet_name)
-                    sync_progress(output_dir, sheet_name)
-                _timestamp(f"批次 {batch_num}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
-            except Exception as e:
-                error_str = str(e).lower()
-                if "429" in error_str or "rate" in error_str:
-                    cfg.mark_429()
-                    if cfg.is_permanently_disabled:
-                        print(f"  [{cfg.api_id} {cfg.model}] 第二次 429，永久停用")
-                    else:
-                        print(f"  [{cfg.api_id} {cfg.model}] 429，冷卻 60 秒")
-                    retry_queue.put_nowait((batch_num, batch))
+        batch_num, batch = job.batch_num, job.batch
+        _timestamp(f"[{sheet_name}] 批次 {batch_num}/{total_batches} 開始 ({len(batch)} 条) [{cfg.api_id} {cfg.model}]")
+        try:
+            results = await _translate_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
+            new_backup = {}
+            for res in results:
+                idx = res.get("index")
+                trans = res.get("translation")
+                if idx is not None and trans is not None:
+                    df.at[idx, "translation"] = trans
+                    new_backup[str(idx)] = str(trans)
+            if new_backup:
+                save_backup_part(output_dir, session_tag, batch_num, new_backup, sheet_name)
+                sync_progress(output_dir, sheet_name)
+            _timestamp(f"[{sheet_name}] 批次 {batch_num}/{total_batches} 完成 ({len(new_backup)} 条) [{cfg.api_id} {cfg.model}]")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "rate" in error_str:
+                cfg.mark_429()
+                if cfg.is_permanently_disabled:
+                    print(f"  [{cfg.api_id} {cfg.model}] 第 {cfg.strike} 次 429，永久停用")
                 else:
-                    print(f"  [{cfg.api_id} {cfg.model}] 錯誤：{e}")
-            finally:
-                ws["active_count"] -= 1
+                    print(f"  [{cfg.api_id} {cfg.model}] 第 {cfg.strike} 次 429，冷卻 60 秒")
+                pool.retry(job)
+            else:
+                print(f"  [{cfg.api_id} {cfg.model}] 錯誤：{e}")
 
+    if not batches:
+        return df
     try:
-        await run_worker_pool(active_configs, batches, _process_batch)
+        await asyncio.gather(*[pool.submit(bn, b, _process_batch) for bn, b in enumerate(batches, 1)])
     except (asyncio.CancelledError, KeyboardInterrupt):
         sync_progress(output_dir, sheet_name)
-        print(f"\n  ⚠️ 檢測到中斷，已儲存翻譯備份")
+        print("\n  ⚠️檢測到中斷，已儲存翻譯備份")
         raise
-
     sync_progress(output_dir, sheet_name)
-    _timestamp("翻译完成")
+    _timestamp(f"[{sheet_name}] 翻译完成")
     return df
 
 def _group_into_batches(pending):
@@ -515,41 +421,3 @@ def _group_into_batches(pending):
     return batches
 
 
-def translate_all(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = None,
-                  sheet_name: str | None = None) -> pd.DataFrame:
-    df = df.copy()
-
-    # ── 從備份還原已翻譯的內容 ──
-    backup = load_backup(output_dir, sheet_name)
-    if backup:
-        restore_count = 0
-        for idx_str, trans in backup.items():
-            idx = int(idx_str)
-            if idx in df.index and (pd.isna(df.at[idx, "translation"]) or df.at[idx, "translation"] is None):
-                df.at[idx, "translation"] = trans
-                restore_count += 1
-        if restore_count > 0:
-            print(f"  從備份還原 {restore_count} 條翻譯")
-
-    if "translation" not in df.columns:
-        df["translation"] = None
-    pending = []
-    for idx, row in df.iterrows():
-        if pd.isna(row.get("translation")) or row["translation"] is None:
-            pending.append({
-                "_idx": idx,
-                "english": str(row["english"]),
-                "sub_category": str(row.get("sub_category", "")),
-                "notes": row.get("notes"),
-                "wiki_url": row.get("wiki_url"),
-            })
-    if not pending:
-        print("  所有条目已完成，无需翻译")
-        return df
-
-    pending.sort(key=lambda x: (x.get("sub_category", ""), x.get("_idx", 0)))
-    total = len(pending)
-    print(f"  待翻译: {total} 条")
-
-    df = asyncio.run(_translate_all_async(df, glossary, output_dir, pending, sheet_name))
-    return df

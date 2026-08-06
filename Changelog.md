@@ -114,3 +114,30 @@
   - Single placeholder fix: when the source has exactly one `[]`, overwrites the translation's `[]` content with the source's
   - Space fix: automatically removes six types of abnormal spaces while preserving legitimate ones
 - **Fixed false positive for placeholder-only entries**: Entries where removing all `[]` leaves only whitespace or punctuation are no longer flagged as untranslated
+
+
+## 7/8/2026 v0.3.1 -> v0.3.2
+
+### 中文
+- 新增多工作表並行（翻譯與校對皆支援）：所有工作表在同一階段內並行處理，階段間同步（全部表完成該階段才進下一階段）
+- 新增共享批次池（shared_pool.py）：整個執行共用一份 API 配置、並發與 429 冷卻狀態；每個 API 依 parallel_limit 建立多個 worker，批次真正並行處理
+- 新增 API_TIMEOUT 統一逾時常數（api_config.py，預設 3600 秒）：主翻譯、校對各階段與重譯共用
+- 新增 PERMANENT_DISABLE_AFTER 常數（api_config.py，預設 2）：可調整 429 停用次數
+- 重譯逾時修正：固定 60 秒逾時造成慢速 API 誤判 Request timed out.，改為統一逾時
+- 純空格問題不再送 LLM：由腳本機械式處理，節省 API 調用
+- 術語正則快取：每個術語只編譯一次，大表掃描大幅加速
+- 審查報告補齊四色標記：合併報告補上空格問題綠色標記
+- checkpoint 全面原子寫入：新增 atomic_write_text helper（.tmp → fsync → rename），session、progress、part、enforce、階段標記、模板、P2、P3 統一使用
+- 移除大量死代碼：run_worker_pool、translate_all、enforce 同步包裝與未使用的 import、函數、變數
+
+### English
+- Added multi-worksheet parallelism for both translation and proofreading: all sheets run concurrently within each phase, with a phase barrier (all sheets must finish a phase before the next starts)
+- Added a shared batch pool (shared_pool.py): one set of API configs, concurrency and 429 state for the whole run; each API spawns parallel_limit workers so batches truly run concurrently
+- Added unified API_TIMEOUT constant (api_config.py, default 3600s) shared by translation, proofreading phases and retranslation
+- Added PERMANENT_DISABLE_AFTER constant (api_config.py, default 2) to tune the 429 disable threshold
+- Fixed retranslation timeout: the fixed 60s timeout caused spurious Request timed out. on slow APIs; now uses the unified timeout
+- Space-only issues are no longer sent to the LLM; handled by script preprocessing
+- Cached compiled glossary regexes so each term is compiled only once, speeding up large-sheet scanning
+- Completed the four-color review report: the merged report now colors space issues green
+- Unified atomic checkpoint writes via atomic_write_text (.tmp -> fsync -> rename) for session/progress/part/enforce/phase markers/template/P2/P3 files
+- Removed dead code: run_worker_pool, translate_all, enforce sync wrapper and unused imports/functions/variables

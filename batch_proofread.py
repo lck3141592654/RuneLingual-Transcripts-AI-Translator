@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # batch_proofread.py - 自動化校對互動式 CLI
 
-import sys, os, json, asyncio
+import sys, json, asyncio
 from pathlib import Path
 from datetime import datetime
 import pandas as pd
@@ -259,7 +259,6 @@ def main():
             completed_sheets = list(exist_session.get("completed_sheets", []))
             sheet_configs = exist_session.get("sheet_configs", {})
             all_sheets = list(completed_sheets) + list(pending_sheets)
-            overall_start = datetime.now()
             t0 = datetime.now(); timestamp("正在載入術語庫...")
             if glossary_path_str == "__AUTO__":
                 glossary = auto_extract_glossary(excel_path, str(_get_workplace()))

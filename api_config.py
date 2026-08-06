@@ -17,6 +17,12 @@ FALLBACK_DEFAULT_LIMIT = 1
 # 每個 API 獨立的最小請求間隔（秒）
 REQUEST_INTERVAL = 1
 
+# 所有 LLM 請求的統一逾時（秒）
+API_TIMEOUT = 3600
+
+# 429 停用次數：累計第 N 次 429 後永久停用（預設 2，可自行調整）
+PERMANENT_DISABLE_AFTER = 2
+
 
 @dataclass
 class ApiConfig:
@@ -49,8 +55,8 @@ class ApiConfig:
 
     @property
     def is_permanently_disabled(self) -> bool:
-        """第二次 429 後永久停用"""
-        return self.strike >= 2
+        """累計 429 達 PERMANENT_DISABLE_AFTER 次後永久停用"""
+        return self.strike >= PERMANENT_DISABLE_AFTER
 
     @property
     def is_available(self) -> bool:

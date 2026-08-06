@@ -1,15 +1,15 @@
 import pandas as pd
 from pathlib import Path
-from openai import AsyncOpenAI
-import os, json, asyncio, time, re
+import json, asyncio, time, re
 from dotenv import load_dotenv
 from datetime import datetime
 
 load_dotenv()
 
 from glossary import normalize_term
-from llm_translator import BATCH_SIZE_LIMIT
-from api_config import load_api_configs, REQUEST_INTERVAL
+from llm_translator import BATCH_SIZE_LIMIT, atomic_write_text
+from api_config import API_TIMEOUT
+from shared_pool import SharedBatchPool
 
 RETRY_PROMPTS = [
     "1. 禁止翻譯 [] 内的内容，如果译文中 [] 内的内容与原文不同，必須恢复为原文的占位符。"
@@ -22,6 +22,23 @@ RETRY_PROMPTS = [
     "如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式：",
 ]
 
+_re_cache: dict = {}
+
+
+def _cached_patterns(term: str):
+    """Cache compiled regex per glossary term; returns (pat, norm_pat)."""
+    cached = _re_cache.get(term)
+    if cached is None:
+        pat = re.compile(r"(?<![a-z'])" + re.escape(term.lower()) + r"(?![a-z'])")
+        norm = normalize_term(term)
+        norm_pat = None
+        if norm != term.lower():
+            norm_pat = re.compile(r"(?<![a-z'])" + re.escape(norm) + r"(?![a-z'])")
+        cached = (pat, norm_pat)
+        _re_cache[term] = cached
+    return cached
+
+
 def _find_matched_spans(eng_lower: str, glossary: dict) -> list:
     """對每條原文找出所有匹配到（詞邊界）的術語及其 span，按術語長度降序排列。
 
@@ -29,12 +46,10 @@ def _find_matched_spans(eng_lower: str, glossary: dict) -> list:
     """
     matches = []
     for eng, chn in glossary.items():
-        pat_str = r"(?<![a-z'])" + re.escape(eng.lower()) + r"(?![a-z'])"
-        spans = [m.span() for m in re.finditer(pat_str, eng_lower)]
-        norm = normalize_term(eng)
-        if norm != eng.lower():
-            norm_pat = r"(?<![a-z'])" + re.escape(norm) + r"(?![a-z'])"
-            spans.extend([m.span() for m in re.finditer(norm_pat, eng_lower)])
+        pat, norm_pat = _cached_patterns(eng)
+        spans = [m.span() for m in pat.finditer(eng_lower)]
+        if norm_pat is not None:
+            spans.extend([m.span() for m in norm_pat.finditer(eng_lower)])
         if spans:
             matches.append((eng, chn, spans))
     # 長術語優先處理（避免短術語被長術語覆蓋時誤報）
@@ -197,9 +212,13 @@ def scan_issues(df, relevant_glossary) -> list[tuple]:
 
     return pool
 
+def _filter_llm_pool(pool):
+    """Keep only entries needing LLM retranslation; pure space issues are handled by scripts."""
+    return [item for item in pool if any(itype != "space" for itype, _, _ in item[2])]
+
+
 async def _retry_round(client, model_name, pool, glossary_text, rnd):
     """非同步執行一輪重譯，返回修正後的條目數"""
-    total_before = len(pool)
     # 每批 BATCH_SIZE_LIMIT（100）條，無群組機制
     all_results = []
     for bs in range(0, len(pool), BATCH_SIZE_LIMIT):
@@ -208,12 +227,13 @@ async def _retry_round(client, model_name, pool, glossary_text, rnd):
         prompt = (RETRY_PROMPTS[rnd] + "\n" + json.dumps(items, ensure_ascii=False)
                   + f"\n## 强制术语表（请严格使用以下翻译）\n{glossary_text}"
                   + "\n请回传 JSON 阵列，每条包含 index 和 translation。")
+        content = ""
         for attempt in range(3):
             try:
                 resp = await client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0, timeout=60,
+                    temperature=0, timeout=API_TIMEOUT,
                 )
                 # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
                 content = resp.choices[0].message.content.strip()
@@ -237,7 +257,7 @@ async def _retry_round(client, model_name, pool, glossary_text, rnd):
                     pass
                 # ↑ 修復結束
                 print(f"    JSON 解析失敗 (嘗試 {attempt + 1}/3): {e}")
-                print(f"    原始回傳內容前 200 字: {content[:200] if 'content' in dir() else 'N/A'}")
+                print(f"    原始回傳內容前 200 字: {content[:200]}")
                 if attempt < 2:
                     await asyncio.sleep(2)
             except Exception as e:
@@ -249,23 +269,20 @@ async def _retry_round(client, model_name, pool, glossary_text, rnd):
                                for idx, _, _ in batch])
     return all_results
 
-async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, sheet_name=None):
+async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, sheet_name=None, shared_pool=None):
     """非同步執行重譯循環，使用多 API 共享隊列模式（支援續傳）"""
     from llm_translator import save_backup_part, _sanitize_sheet_name
     import uuid
-    api_configs = load_api_configs()
-    if not api_configs:
+    if shared_pool is None:
         print("  無可用 API，跳過重譯")
         return df
 
     # ── 檢查 enforce checkpoint ──
     start_round = 0
     enforce_tag = uuid.uuid4().hex[:8]
-    cp_dir = None
     cp_file = None
     if output_dir and sheet_name:
-        cp_dir = Path(output_dir) / "_checkpoint" / _sanitize_sheet_name(sheet_name)
-        cp_file = cp_dir / "enforce_checkpoint.json"
+        cp_file = Path(output_dir) / "_checkpoint" / _sanitize_sheet_name(sheet_name) / "enforce_checkpoint.json"
         if cp_file.exists():
             try:
                 cp_data = json.loads(cp_file.read_text(encoding="utf-8"))
@@ -299,7 +316,6 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
             if before_parts:
                 print(f"  ⚡ 腳本預處理前問題：{'、'.join(before_parts)}")
 
-            pre_count_before = len(pool)
             preprocess_issues(df, pool)
             pool = scan_issues(df, relevant_glossary)
 
@@ -318,9 +334,14 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
         if not pool:
             print(f"  第 {rnd + 1} 轮检查：全部正确")
             break
-        if len(pool) < 3:
-            print(f"  第 {rnd + 1} 轮检查：{len(pool)} 条有问题（少于3条，跳过重译）")
+        llm_pool = _filter_llm_pool(pool)
+        if not llm_pool:
+            print(f"  第 {rnd + 1} 轮检查：剩餘問題皆為空格問題，由腳本處理，跳過重譯")
             break
+        if len(llm_pool) < 3:
+            print(f"  第 {rnd + 1} 轮检查：{len(llm_pool)} 条有问题（少于3条，跳过重译）")
+            break
+        pool = llm_pool
 
         # ── 掃描問題條目 ──
         gloss_count = sum(1 for _, _, issues in pool for t, _, _ in issues if t == "glossary")
@@ -339,67 +360,38 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
 
         pre_count = len(pool)
 
-        # 分割 pool 為 BATCH_SIZE_LIMIT 大小的批次，放入共享隊列
-        queue: asyncio.Queue = asyncio.Queue()
-        batch_id = 0
-        for bs in range(0, len(pool), BATCH_SIZE_LIMIT):
-            batch_slice = pool[bs:bs + BATCH_SIZE_LIMIT]
-            queue.put_nowait((batch_id, batch_slice))
-            batch_id += 1
-            total_batches = batch_id
+        # 分割問題條目為 BATCH_SIZE_LIMIT 大小的批次，丟進共享池
+        batches = [pool[bs:bs + BATCH_SIZE_LIMIT] for bs in range(0, len(pool), BATCH_SIZE_LIMIT)]
+        total_batches = len(batches)
 
-        # 為每個 API 啟動 worker
-        async def enforce_worker(cfg):
-            client = AsyncOpenAI(api_key=cfg.key, base_url=cfg.base_url)
-            sem = asyncio.Semaphore(cfg.parallel_limit)
-            rate_lock = asyncio.Lock()
-            last_request = 0.0
+        async def _retry_process(ws, job):
+            cfg = ws["cfg"]
+            batch_slice = job.batch
+            try:
+                results = await _retry_round(ws["client"], cfg.model, batch_slice, glossary_text, rnd)
+                fixed = 0
+                for res in results:
+                    idx = res.get("index")
+                    trans = res.get("translation")
+                    if idx is not None and trans is not None:
+                        df.at[idx, "translation"] = trans
+                        fixed += 1
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"  [{now}] [重譯] 批次 {job.batch_num}/{total_batches} 完成 ({fixed} 条已修正) [{cfg.api_id} {cfg.model}]")
+            except Exception as e:
+                error_str = str(e).lower()
+                if "429" in error_str or "rate" in error_str:
+                    cfg.mark_429()
+                    if cfg.is_permanently_disabled:
+                        print(f"  [{cfg.api_id} {cfg.model}] 第 {cfg.strike} 次 429，永久停用")
+                    else:
+                        print(f"  [{cfg.api_id} {cfg.model}] 第 {cfg.strike} 次 429，冷卻 60 秒")
+                    shared_pool.retry(job)
+                else:
+                    print(f"  [{cfg.api_id} {cfg.model}] 錯誤：{e}")
 
-            while True:
-                if cfg.is_cooling_down:
-                    await asyncio.sleep(1)
-                    continue
-
-                async with sem:
-                    try:
-                        bid, batch_slice = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return
-
-                    # 速率控制（每個 API 獨立）
-                    async with rate_lock:
-                        now = time.monotonic()
-                        gap = REQUEST_INTERVAL - (now - last_request)
-                        if gap > 0:
-                            await asyncio.sleep(gap)
-                        last_request = time.monotonic()
-
-                    try:
-                        results = await _retry_round(client, cfg.model, batch_slice, glossary_text, rnd)
-                        fixed = 0
-                        for res in results:
-                            idx = res.get("index")
-                            trans = res.get("translation")
-                            if idx is not None and trans is not None:
-                                df.at[idx, "translation"] = trans
-                                fixed += 1
-                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        print(f"  [{now}] [重譯] 批次 {bid + 1}/{total_batches} 完成 ({fixed} 条已修正) [{cfg.api_id} {cfg.model}]")
-                    except Exception as e:
-                        error_str = str(e).lower()
-                        if "429" in error_str or "rate" in error_str:
-                            cfg.mark_429()
-                            if cfg.is_permanently_disabled:
-                                print(f"  [{cfg.api_id} {cfg.model}] 第二次 429，永久停用")
-                            else:
-                                print(f"  [{cfg.api_id} {cfg.model}] 429，冷卻 60 秒")
-                            # 放回隊列
-                            queue.put_nowait((bid, batch_slice))
-                        else:
-                            print(f"  [{cfg.api_id} {cfg.model}] 錯誤：{e}")
-
-        workers = [asyncio.create_task(enforce_worker(cfg)) for cfg in api_configs]
-        await asyncio.gather(*workers)
+        if batches:
+            await asyncio.gather(*[shared_pool.submit(bn, b, _retry_process) for bn, b in enumerate(batches, 1)])
 
         # 計算修正率，決定是否繼續
         post_pool = scan_issues(df, relevant_glossary)
@@ -417,16 +409,11 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
         # ★ 儲存 enforce checkpoint ★
         if cp_file:
             cp_file.parent.mkdir(parents=True, exist_ok=True)
-            import os as _os
-            tmp = cp_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps({
+            atomic_write_text(cp_file, json.dumps({
                 "completed_rounds": rnd + 1,
                 "enforce_tag": enforce_tag,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
-            with open(tmp, 'ab') as f:
-                _os.fsync(f.fileno())
-            tmp.replace(cp_file)
+            }, ensure_ascii=False, indent=2))
 
         post_count = len(post_pool)
         if post_count == 0:
@@ -450,9 +437,9 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
 
     return df
 
-def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = None,
-            report_name: str = "review_report.xlsx", write_report: bool = True,
-            sheet_name: str | None = None) -> tuple:
+async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = None,
+                        report_name: str = "review_report.xlsx", write_report: bool = True,
+                        sheet_name: str | None = None, shared_pool=None) -> tuple:
     df = df.copy()
     review_rows = []
 
@@ -464,12 +451,20 @@ def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = No
     }
     glossary_text = "\n".join([f"  {e} → {c}" for e, c in relevant_glossary.items()]) if relevant_glossary else "  无"
 
-    # 檢查是否有可用 API
-    api_configs = load_api_configs()
-
-    # 非同步重譯
-    if api_configs:
-        df = asyncio.run(_enforce_async(df, relevant_glossary, glossary_text, output_dir, sheet_name))
+    # 非同步重譯（使用共享池；未提供時建立臨時池）
+    if shared_pool is not None:
+        df = await _enforce_async(df, relevant_glossary, glossary_text, output_dir, sheet_name, shared_pool)
+    else:
+        tmp_pool = SharedBatchPool()
+        try:
+            await tmp_pool.start()
+        except RuntimeError:
+            tmp_pool = None
+        if tmp_pool is not None:
+            try:
+                df = await _enforce_async(df, relevant_glossary, glossary_text, output_dir, sheet_name, tmp_pool)
+            finally:
+                await tmp_pool.close()
 
     # 最終審查掃描
     final_pool = scan_issues(df, relevant_glossary)
@@ -488,12 +483,12 @@ def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = No
     if write_report and not review_df.empty:
         fp = Path(output_dir) / report_name if output_dir else Path(__file__).parent / report_name
 
-        from openpyxl.styles import PatternFill
+        from openpyxl.styles import Color, PatternFill
 
-        fill_glossary = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
-        fill_placeholder = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-        fill_untranslated = PatternFill(start_color="F4CCCC", end_color="F4CCCC", fill_type="solid")
-        fill_space = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+        fill_glossary = PatternFill(start_color=Color(rgb="D9D9D9"), end_color=Color(rgb="D9D9D9"), fill_type="solid")
+        fill_placeholder = PatternFill(start_color=Color(rgb="BDD7EE"), end_color=Color(rgb="BDD7EE"), fill_type="solid")
+        fill_untranslated = PatternFill(start_color=Color(rgb="F4CCCC"), end_color=Color(rgb="F4CCCC"), fill_type="solid")
+        fill_space = PatternFill(start_color=Color(rgb="E2EFDA"), end_color=Color(rgb="E2EFDA"), fill_type="solid")
 
         with pd.ExcelWriter(fp, engine='openpyxl') as writer:
             review_df.to_excel(writer, index=False, sheet_name='Sheet1')
@@ -525,3 +520,5 @@ def enforce(df: pd.DataFrame, glossary: dict, output_dir: str | Path | None = No
 
         print(f"  审查报告已写入: {fp} ({len(review_df)} 条需审查)")
     return df, review_df
+
+
