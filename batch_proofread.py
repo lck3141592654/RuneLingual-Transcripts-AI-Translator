@@ -9,7 +9,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from glossary import load_glossary, auto_extract_glossary
-from proofreader import run_proofread, _load_session, _proofread_checkpoint_dir
+from proofreader import (run_proofread, run_quick_proofread,
+                         _load_session, _load_quick_session,
+                         _proofread_checkpoint_dir, _quick_checkpoint_dir)
 
 SEP = chr(61)*60
 
@@ -24,6 +26,17 @@ def timestamp(msg):
 def elapsed(start, label):
     secs = (datetime.now() - start).total_seconds()
     print(f"  [{label}] 耗時: {secs:.1f} 秒")
+
+def validate_columns(excel_path, sheet_names, required=("english", "translation")) -> bool:
+    """檢查目標工作表是否具備必要欄位，避免後續 KeyError。"""
+    ok = True
+    for sn in sheet_names:
+        df = pd.read_excel(excel_path, sheet_name=sn, dtype=str)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print(f"  錯誤：工作表「{sn}」缺少必要欄位: {', '.join(missing)}")
+            ok = False
+    return ok
 
 def list_excel_files(directory):
     if not directory.exists():
@@ -67,7 +80,8 @@ def choose_multi(items, title):
             choice = input("\n請輸入編號（可多個以逗號分隔）: ").strip()
             if choice == "0":
                 return list(items)
-            indices = [int(x.strip()) for x in choice.split(",") if x.strip()]
+            raw_indices = [int(x.strip()) for x in choice.split(",") if x.strip()]
+            indices = list(dict.fromkeys(raw_indices))
             selected = [items[i-1] for i in indices if 1 <= i <= len(items)]
             if selected:
                 return selected
@@ -180,12 +194,19 @@ def step4(excel_path, sheet_name, df=None):
         except (ValueError, IndexError):
             pass
         print("  無效範圍。")
-def confirm(excel_path, glossary_path, sheet_names, total_selected):
+def confirm(excel_path, glossary_path, sheet_names, total_selected, mode="proofread"):
     print(f"\n{SEP}")
     print("  確認資訊")
     print(SEP)
     print(f"  目標: {excel_path.name}")
-    print(f"  術語庫: {Path(glossary_path).name if glossary_path else '自動萃取'}")
+    print(f"  模式: {'快速校對' if mode == 'quick_proofread' else '完整校對'}")
+    if glossary_path and str(glossary_path) == "__AUTO__":
+        glossary_label = "自動萃取（name/manual 工作表）"
+    elif glossary_path:
+        glossary_label = Path(glossary_path).name
+    else:
+        glossary_label = "自動萃取"
+    print(f"  術語庫: {glossary_label}")
     print(f"  工作表: {len(sheet_names)}")
     for sn in sheet_names:
         print(f"    - {sn}")
@@ -196,8 +217,11 @@ def confirm(excel_path, glossary_path, sheet_names, total_selected):
 
 def find_existing_progress():
     session = _load_session(str(_get_workplace()))
-    if session and session.get("mode") == "proofread":
+    if session and session.get("mode") in ("proofread", "quick_proofread"):
         return session
+    quick_session = _load_quick_session(str(_get_workplace()))
+    if quick_session and quick_session.get("mode") == "quick_proofread":
+        return quick_session
     return None
 
 def prompt_resume(session):
@@ -205,6 +229,8 @@ def prompt_resume(session):
     print("  發現上次校對進度")
     print(SEP)
     print(f"  目標: {Path(session['excel_path']).name}")
+    mode_label = "快速校對" if session.get("mode") == "quick_proofread" else "完整校對"
+    print(f"  模式: {mode_label}")
     cs = session.get("completed_sheets", [])
     ps = session.get("pending_sheets", [])
     print(f"  已完成工作表: {len(cs)}")
@@ -217,6 +243,18 @@ def main():
     print("      校對管線 v1.0")
     print(f"      工作目錄: {_get_workplace()}")
     print(SEP)
+    print(f"\n  請選擇校對模式：")
+    print(f"  [1] 完整校對（流暢度評估 + 潤色 + 重譯保護）")
+    print(f"  [2] 快速校對（只做重譯修正：術語/佔位符/未翻譯/空格）")
+    while True:
+        mode_choice = input("\n  請輸入: ").strip()
+        if mode_choice == "1":
+            mode = "proofread"
+            break
+        if mode_choice == "2":
+            mode = "quick_proofread"
+            break
+        print("  無效輸入，請重新輸入。")
 
     # ── 檢查上次的 debug 訊息 ──
     debug_dir = _get_workplace() / "_debugmessage"
@@ -244,9 +282,26 @@ def main():
         print(f"  已清除 debug 訊息\n")
 
     exist_session = find_existing_progress()
+    if exist_session and exist_session.get("mode") != mode:
+        old_label = "完整校對" if exist_session.get("mode") == "proofread" else "快速校對"
+        new_label = "快速校對" if mode == "quick_proofread" else "完整校對"
+        print(f"\n  ⚠️ 偵測到「{old_label}」的未完成進度，與目前選擇的「{new_label}」不同")
+        if input("  是否清除舊進度並以新模式開始？(y/n): ").strip().lower() != "y":
+            print("  已取消。")
+            input("\n按 Enter 鍵...")
+            return
+        old_cp = (_quick_checkpoint_dir if exist_session.get("mode") == "quick_proofread" else _proofread_checkpoint_dir)(str(_get_workplace()))
+        if old_cp.exists():
+            import shutil
+            shutil.rmtree(old_cp)
+        print("  已清除舊進度。")
+        exist_session = None
     if exist_session:
         if not prompt_resume(exist_session):
-            cp = _proofread_checkpoint_dir(str(_get_workplace()))
+            if exist_session.get("mode") == "quick_proofread":
+                cp = _quick_checkpoint_dir(str(_get_workplace()))
+            else:
+                cp = _proofread_checkpoint_dir(str(_get_workplace()))
             if cp.exists():
                 import shutil; shutil.rmtree(cp)
                 print("\n  已清除舊進度。")
@@ -266,12 +321,18 @@ def main():
                 glossary = load_glossary(glossary_path, glossary_sheets if glossary_path else None)
             elapsed(t0, "術語庫")
             print(f"  術語庫載入完成: {len(glossary)} 條")
-            asyncio.run(run_proofread(excel_path, glossary_path, glossary_sheets, all_sheets, sheet_configs))
+            if exist_session.get("mode") == "quick_proofread":
+                asyncio.run(run_quick_proofread(excel_path, glossary_path, glossary_sheets, all_sheets, sheet_configs))
+            else:
+                asyncio.run(run_proofread(excel_path, glossary_path, glossary_sheets, all_sheets, sheet_configs))
             return
     # 全新執行
     excel_path = step1()
     glossary_path, glossary_sheets = step2(excel_path)
     sheet_names = step3(excel_path)
+    if not validate_columns(excel_path, sheet_names):
+        input("\n按 Enter 鍵...")
+        return
     sheet_configs = {}
     cached_dfs = {}
     for sn in sheet_names:
@@ -289,11 +350,14 @@ def main():
         print("\n未選取任何條目。")
         input("\n按 Enter 鍵...")
         return
-    if not confirm(excel_path, glossary_path, sheet_names, total_selected):
+    if not confirm(excel_path, glossary_path, sheet_names, total_selected, mode):
         print("  已取消。")
         input("\n按 Enter 鍵...")
         return
-    asyncio.run(run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names, sheet_configs))
+    if mode == "quick_proofread":
+        asyncio.run(run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_names, sheet_configs))
+    else:
+        asyncio.run(run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names, sheet_configs))
     input("\n按 Enter 關閉...")
 
 if __name__ == "__main__":

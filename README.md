@@ -12,7 +12,10 @@
 
 > ⚠️ **測試版公告**：本工具目前為測試階段，暫時只支援**簡體中文**翻譯。其他語言將在正式版中支援。
 
-## 最近更新 (7/8/2026)，更新詳情請看 [Changelog](Changelog.md)
+## 最近更新 (8/8/2026)，更新詳情請看 [Changelog](Changelog.md)
+- **快速校對模式**：只做重譯修正（術語/佔位符/未翻譯/空格），跳過流暢度評估與潤色
+- **過量回傳政策**：回傳超過批次 120% 視為失敗走 3 輪重試；依 index 對號入座且只採用本批次的 index
+- **重譯 429 與主翻譯一致**：冷卻/永久停用/批次重排
 - **多工作表並行**：翻譯與校對支援多工作表並行處理（階段間同步＋共享批次池）
 - **統一逾時常數**：新增 API_TIMEOUT（預設 3600 秒）
 - **429 停用次數常數**：新增 PERMANENT_DISABLE_AFTER（預設 2）
@@ -37,8 +40,8 @@
 | 檔案 | 用途                              |
 |---|---------------------------------|
 | `batch_translate.py` | **主翻譯腳本** — 互動式操作入口 |
-| `batch_proofread.py` | **校對腳本** — 互動式操作入口 |
-| `proofreader.py` | **校對核心模組** — LLM 雙輪評估 + 潤色 + 重譯保護 |
+| `batch_proofread.py` | **校對腳本** — 互動式操作入口（完整校對 / 快速校對） |
+| `proofreader.py` | **校對核心模組** — LLM 雙輪評估 + 潤色 + 重譯保護（含快速校對/重譯模式） |
 | `glossary.py` | 讀取術語庫 Excel 或自動萃取術語庫 + 輸出審查檔 |
 | `tm_matcher.py` | 模板化比對（**尚未啟用**，將在正式版加入） |
 | `llm_translator.py` | **AI 批次翻譯核心**，非同步並行調用，含智慧 JSON 提取與 json_repair 修復 |
@@ -54,6 +57,7 @@
 > - `_proofread_checkpoint/` — 校對專用續傳暫存，獨立於主翻譯
 > - `_proofread_backup/` — 校對備份
 > - `_debugmessage/` — 低翻譯率 debug 記錄（自動產生，下次啟動時顯示後清除）
+> - `_quick_checkpoint/` — 快速校對續傳暫存（獨立於完整校對，完成後自動刪除）
 
 ### 階段流程
 
@@ -73,6 +77,14 @@ batch_proofread.py → 多工作表並行（階段間同步）：
 ③ Phase 4a: 重譯保護（全部工作表並行）
 ④ Phase 4b: 模板校正（所有工作表完成後執行）
 ⑤ 生成報告
+```
+
+```
+快速校對（重譯模式）
+batch_proofread.py → 選擇「快速校對」後只執行：
+① Phase 4a: 重譯修正（術語/佔位符/未翻譯/空格，全部工作表並行）
+② Phase 4b: 模板校正
+③ 生成報告（quick_proofread_report.xlsx）
 ```
 
 ---
@@ -142,7 +154,7 @@ Step 1：選擇目標 Excel    → 從 workplace/ 下列出所有 .xlsx 檔案
 Step 2：選擇術語庫        → 可選 Excel 術語庫、自動從目標 Excel 萃取、或跳過（只有 ADD_LIST 硬編碼術語）
 Step 3：選擇工作表        → 單選或多選
 Step 4：選擇翻譯範圍      → 全部未翻譯 / 前 N 條測試 / 指定行數
-Step 5：確認執行          → 顯示摘要後按 Y 確認
+Step 5：確認執行          → 完整校對（Phase 2→3→4a→4b→報告）；快速校對（Phase 4a→4b→報告）
 ```
 
 ### 執行後產出
@@ -162,6 +174,7 @@ Step 5：確認執行          → 顯示摘要後按 Y 確認
 ### 互動步驟
 
 ```
+Step 0：選擇校對模式      → [1] 完整校對 / [2] 快速校對（只做重譯修正）
 Step 1：選擇目標 Excel    → 從 `workplace/` 列出所有 `*.xlsx`
 Step 2：選擇術語庫（必選） → 可選 Excel 或自動萃取（校對必須提供術語庫，不可跳過）
 Step 3：選擇工作表        → 選擇要校對的工作表
@@ -176,6 +189,9 @@ Step 5：確認執行          → 開始校對（Phase 2→3→4a→4b→報告
 |`proofread_report.xlsx` | **校對摘要報告**（Type1/Type2 彩色標記）            |
 | `review_report_proofread.xlsx` | **重譯保護審查明細**                            |
 | `_proofread_checkpoint/` | **中斷續傳暫存目錄**，位於 `workplace/`（校對完成後自動刪除） |
+| `{來源檔名}_quick_proofread_output.xlsx` | **快速校對後的完整 Excel**（僅重譯修正） |
+| `quick_proofread_report.xlsx` | **快速校對審查報告**（僅四類機械問題、四色標記） |
+| `_quick_checkpoint/` | **快速校對續傳暫存目錄**，位於 `workplace/`（完成後自動刪除） |
 
 ---
 
@@ -185,7 +201,7 @@ Step 5：確認執行          → 開始校對（Phase 2→3→4a→4b→報告
 
 **續傳流程：**
 1. 重新執行 `batch_translate.py`/`batch_proofread.py`
-2. 腳本會自動掃描 `workplace/_checkpoint/session.json`（主翻譯）或 `workplace/_proofread_checkpoint/session.json`（校對），偵測未完成的進度
+2. 腳本會自動掃描 `workplace/_checkpoint/session.json`（主翻譯）、`workplace/_proofread_checkpoint/session.json`（完整校對）或 `workplace/_quick_checkpoint/session.json`（快速校對），偵測未完成的進度
 3. 顯示上次的翻譯設定摘要（Excel、工作表、進度）
 4. 詢問是否繼續上次的進度：
 
@@ -314,8 +330,8 @@ IGNORE_LIST: set[str] = {
 **Q：執行後出現 `ImportError: No module named 'openai'`**
 <br>A：尚未安裝依賴，執行 `pip install openai pandas openpyxl python-dotenv json-repair`。
 
-**Q：出現 `ValueError: 请设定 API_KEY 环境变量或在 .env 档案中设定`**
-<br>A：忘記建立 `.env` 檔案。複製 `.env.example` 為 `.env`，填入你的 API Key。
+**Q：啟動後出現 `no available API` 或「已載入 0 個可用 API」**
+<br>A：`.env` 尚未建立或設定無效（缺少 API_KEY / MODEL / BASE_URL）。複製 `.env.example` 為 `.env`，填入 API Key 後再執行；腳本也會印出各 API 缺少欄位的警告。
 
 **Q：API 請求一直失敗或超時**
 <br>A：檢查 `.env` 中的 `BASE_URL` 和 `MODEL` 是否正確。如果是 OpenRouter，確認帳戶餘額是否足夠。也可嘗試調低主/副 API 的並發數來降低 Rate Limit 風險。
@@ -348,7 +364,7 @@ IGNORE_LIST: set[str] = {
 ### 中斷續傳相關
 
 **Q：續傳時偵測不到進度**
-<br>A：續傳依賴 `workplace/_checkpoint/session.json`。如果你手動搬移檔案，需要將整個 `_checkpoint/` 目錄一併移動。如果手動刪除了 `session.json`，續傳功能將無法使用。
+<br>A：主翻譯依賴 `workplace/_checkpoint/session.json`，完整校對依賴 `workplace/_proofread_checkpoint/session.json`，快速校對依賴 `workplace/_quick_checkpoint/session.json`。搬移檔案時要連同對應的整個目錄一起移動；刪掉 `session.json` 就無法續傳。
 
 **Q：續傳時某個工作表的翻譯遺失**
 <br>A：續傳會自動還原已完成工作表的資料。若中斷發生在翻譯過程中，重新執行腳本即可從中斷的工作表繼續。
@@ -376,10 +392,13 @@ IGNORE_LIST: set[str] = {
 <br>A：校對階段的 75% 完成率檢查是正常機制，會在 3 次嘗試內自動重試。若 3 次後仍低，則接受該結果並記錄 debug 訊息。
 
 **Q：校對報告中 Type1 和 Type2 是什麼？**
-<br>A：Type1 是腳本可自動偵測的術語/佔位符/未翻譯問題，在報告中以背景顏色標記。Type2 是 LLM 雙輪評估發現的流暢度問題，雙輪皆判定良好的條目會被跳過。
+<br>A：Type1 是腳本可自動偵測的術語/佔位符/未翻譯問題，在報告中以背景顏色標記。Type2 是 LLM 雙輪評估發現的流暢度問題；只有 (沒問題,沒問題)、(沒問題,輕度)、(輕度,沒問題) 三種組合會跳過，兩輪皆「輕度」仍會送潤色。
 
 **Q：校對可以處理多個工作表嗎？**
 <br>A：支援。校對會以階段間同步的方式並行處理多個工作表（各階段內全部工作表並行，階段間同步）。
+
+**Q：快速校對和完整校對差在哪？**
+<br>A：快速校對只執行重譯修正（術語/佔位符/未翻譯/空格），不做 P2 流暢度評估與 P3 潤色，速度較快；輸出為 `_quick_proofread_output.xlsx` 與 `quick_proofread_report.xlsx`。
 
 ---
 

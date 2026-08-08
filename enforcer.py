@@ -8,7 +8,7 @@ load_dotenv()
 
 from glossary import normalize_term
 from llm_translator import BATCH_SIZE_LIMIT, atomic_write_text
-from api_config import API_TIMEOUT
+from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
 from shared_pool import SharedBatchPool
 
 RETRY_PROMPTS = [
@@ -106,6 +106,9 @@ def check_untranslated(english_text: str, translated_text) -> list[str]:
         issues.append("translation 欄位為空")
         return issues
     trans_str = str(translated_text).strip()
+    if trans_str.lower() in ("nan", "nat", "none"):
+        issues.append("translation 欄位為空")
+        return issues
     # 情況 B：譯文與原文相同（不分大小寫），且原文包含英文字母
     if trans_str.lower() == english_text.strip().lower():
         if re.search(r'[a-zA-Z]', english_text):
@@ -239,7 +242,10 @@ async def _retry_round(client, model_name, pool, glossary_text, rnd):
                 content = resp.choices[0].message.content.strip()
                 content = re.sub(r"^```(?:json)?\n?", "", content, flags=re.IGNORECASE)
                 content = re.sub(r"\n```$", "", content)
-                all_results.extend(json.loads(content))
+                parsed = json.loads(content)
+                if len(parsed) > int(len(batch) * OVER_RETURN_TOLERANCE):
+                    raise ValueError(f"回傳 {len(parsed)} 條，超過批次 {len(batch)} 的 {int(OVER_RETURN_TOLERANCE * 100)}%，視為失敗重試")
+                all_results.extend(parsed)
                 # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
                 break
             except json.JSONDecodeError as e:
@@ -261,13 +267,21 @@ async def _retry_round(client, model_name, pool, glossary_text, rnd):
                 if attempt < 2:
                     await asyncio.sleep(2)
             except Exception as e:
+                error_str = str(e).lower()
+                if "429" in error_str or "rate" in error_str:
+                    raise
                 print(f"    API 錯誤 (嘗試 {attempt + 1}/3): {e}")
                 if attempt < 2:
                     await asyncio.sleep(5)
         else:
             all_results.extend([{"index": idx, "translation": None, "_error": "API failed"}
                                for idx, _, _ in batch])
-    return all_results
+    batch_indices = {item[0] for item in pool}
+    mapped = {}
+    for r in all_results:
+        if isinstance(r, dict) and r.get("index") in batch_indices:
+            mapped[r["index"]] = r
+    return list(mapped.values())
 
 async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, sheet_name=None, shared_pool=None):
     """非同步執行重譯循環，使用多 API 共享隊列模式（支援續傳）"""
@@ -369,13 +383,23 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
             batch_slice = job.batch
             try:
                 results = await _retry_round(ws["client"], cfg.model, batch_slice, glossary_text, rnd)
+                batch_indices = {item[0] for item in batch_slice}
                 fixed = 0
+                skipped = 0
                 for res in results:
+                    if not isinstance(res, dict):
+                        skipped += 1
+                        continue
                     idx = res.get("index")
                     trans = res.get("translation")
                     if idx is not None and trans is not None:
-                        df.at[idx, "translation"] = trans
-                        fixed += 1
+                        if idx in batch_indices:
+                            df.at[idx, "translation"] = trans
+                            fixed += 1
+                        else:
+                            skipped += 1
+                if skipped:
+                    print(f"  [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件或 index 不在工作表中），已忽略")
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"  [{now}] [重譯] 批次 {job.batch_num}/{total_batches} 完成 ({fixed} 条已修正) [{cfg.api_id} {cfg.model}]")
             except Exception as e:
@@ -415,18 +439,20 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             }, ensure_ascii=False, indent=2))
 
-        post_count = len(post_pool)
-        if post_count == 0:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        post_all_count = len(post_pool)
+        post_count = len(_filter_llm_pool(post_pool))  # 同口徑：與送重譯前一致（不含純空格）
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if post_all_count == 0:
             print(f"  [{now}] 第 {rnd + 1} 轮重译后：全部正确")
+            break
+        if post_count == 0:
+            print(f"  [{now}] 第 {rnd + 1} 轮重译后：剩餘問題皆為空格問題，由腳本處理")
             break
 
         corrected = pre_count - post_count
         rate = corrected / pre_count if pre_count > 0 else 0
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"  [{now}] 第 {rnd + 1} 轮重译后：剩余 {post_count} 条，修正率 {rate * 100:.1f}%")
         if rate < 0.05:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"  [{now}] 修正率低於 5%，跳過後續輪次")
             break
 
@@ -481,7 +507,10 @@ async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path
 
     review_df = pd.DataFrame(review_rows)
     if write_report and not review_df.empty:
-        fp = Path(output_dir) / report_name if output_dir else Path(__file__).parent / report_name
+        if not output_dir:
+            print("  警告：未提供 output_dir，跳過審查報告寫入")
+            return df, review_df
+        fp = Path(output_dir) / report_name
 
         from openpyxl.styles import Color, PatternFill
 

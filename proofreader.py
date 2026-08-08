@@ -19,7 +19,7 @@ from llm_translator import (
 from enforcer import (
     scan_issues, _enforce_async,
 )
-from api_config import API_TIMEOUT
+from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
 from shared_pool import SharedBatchPool
 
 # Constants
@@ -27,6 +27,7 @@ CHECKPOINT_SUBDIR = "_proofread_checkpoint"
 BACKUP_SUBDIR = "_proofread_backup"
 PROGRESS_FILE = "progress.json"
 SESSION_FILE = "session.json"
+QUICK_CHECKPOINT_SUBDIR = "_quick_checkpoint"
 
 def _timestamp(msg):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -114,8 +115,21 @@ SYSTEM_PROMPT_EVAL = (
 )
 
 def _cross_reference(round1, round2):
+    # 跳過組合僅限 (沒問題,沒問題)、(沒問題,輕度)、(輕度,沒問題)；兩輪皆「輕度」仍送潤色
     skip_pairs = {("没问题", "没问题"), ("轻度", "没问题"), ("没问题", "轻度")}
     return (round1.get("level"), round2.get("level")) not in skip_pairs
+
+
+def _pad_eval_results(results, batch):
+    """過濾非 dict 並對回傳條數不足的缺失項用「严重」補位，避免漏報。"""
+    clean = [r for r in results if isinstance(r, dict)]
+    present = {r.get('index') for r in clean}
+    padded = list(clean)
+    for item in batch:
+        idx = item.get('_idx', 0)
+        if idx not in present:
+            padded.append({'index': idx, 'level': '严重', 'reason': '評估缺失，預設為嚴重'})
+    return padded
 
 
 async def _evaluate_batch(client, model, batch, glossary, api_id):
@@ -185,17 +199,22 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
                     results = [results]
                     print(f"    [{api_id}] 3 次嘗試均回傳單一物件，強制使用")
 
-            if isinstance(results, list):
-                results = results[:len(batch)]
-                for res, item in zip(results, batch):
-                    res["index"] = item.get("_idx", 0)
+            if isinstance(results, list) and len(results) > int(len(batch) * OVER_RETURN_TOLERANCE):
+                raise ValueError(f"回傳 {len(results)} 條，超過批次 {len(batch)} 的 {int(OVER_RETURN_TOLERANCE * 100)}%，視為失敗重試")
             if isinstance(results, dict):
                 results = [results]
+            if isinstance(results, list):
+                batch_indices = {item.get("_idx", 0) for item in batch}
+                mapped = {}
+                for r in results:
+                    if isinstance(r, dict) and r.get("index") in batch_indices:
+                        mapped[r["index"]] = r
+                results = list(mapped.values())
 
             if isinstance(results, list) and len(results) > 0:
                 # 低评估率检查（< 75% 視為失敗重試，在所有路徑後執行）
                 success_count = sum(1 for r in results if isinstance(r, dict) and r.get("level") and r.get("reason"))
-                rate = success_count / len(batch) if len(batch) > 0 else 0
+                rate = min(success_count, len(batch)) / len(batch) if len(batch) > 0 else 0
                 if rate < 0.75:
                     if attempt < 2:
                         print(f"    [{api_id}] ⚠️ 完成率 {rate:.0%}（{success_count}/{len(batch)}）低於 75%，重試")
@@ -204,15 +223,16 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
                         print(f"    [{api_id}] ⚠️ 完成率 {rate:.0%}（{success_count}/{len(batch)}）低於 75%，已使用所有嘗試")
 
                 # null 检查
-                null_count = sum(1 for r in results if not r.get("level"))
+                null_count = sum(1 for r in results if isinstance(r, dict) and not r.get("level"))
                 if null_count > len(results) * 0.5:
                     print(f"    [{api_id}] 警告：{null_count}/{len(results)} 条评估为 null")
 
                 # 缺字段检查
-                if results and not all("index" in r and "level" in r for r in results):
+                if results and not all(isinstance(r, dict) and "index" in r and "level" in r for r in results):
                     print(f"    [{api_id}] 警告：JSON 陣列中缺少 index/level 字段")
                     print(f"    回傳內容前 200 字: {text[:200]}")
 
+            results = _pad_eval_results(results, batch)
             return results
 
         except json.JSONDecodeError:
@@ -227,24 +247,30 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
                             results = results["evaluations"]
                         elif "index" in results and "level" in results:
                             raise ValueError("single object after repair, need array")
+                    if isinstance(results, list) and len(results) > int(len(batch) * OVER_RETURN_TOLERANCE):
+                        raise ValueError(f"回傳 {len(results)} 條，超過批次 {len(batch)} 的 {int(OVER_RETURN_TOLERANCE * 100)}%，視為失敗重試")
                     if isinstance(results, list):
-                        results = results[:len(batch)]
-                        for res, item in zip(results, batch):
-                            res["index"] = item.get("_idx", 0)
+                        batch_indices = {item.get("_idx", 0) for item in batch}
+                        mapped = {}
+                        for r in results:
+                            if isinstance(r, dict) and r.get("index") in batch_indices:
+                                mapped[r["index"]] = r
+                        results = list(mapped.values())
                         success_count = sum(1 for r in results if isinstance(r, dict) and r.get("level") and r.get("reason"))
-                        rate = success_count / len(batch) if len(batch) > 0 else 0
+                        rate = min(success_count, len(batch)) / len(batch) if len(batch) > 0 else 0
                         if rate < 0.75:
                             if attempt < 2:
                                 print(f"    [{api_id}] ⚠️ 完成率 {rate:.0%}（{success_count}/{len(batch)}）低於 75%，重試")
                                 raise ValueError(f"completion rate {rate:.0%} < 75%")
                             else:
                                 print(f"    [{api_id}] ⚠️ 完成率 {rate:.0%}（{success_count}/{len(batch)}）低於 75%，已使用所有嘗試")
-                        null_count = sum(1 for r in results if not r.get("level"))
+                        null_count = sum(1 for r in results if isinstance(r, dict) and not r.get("level"))
                         if null_count > len(results) * 0.5:
                             print(f"    [{api_id}] 警告：{null_count}/{len(results)} 条评估为 null")
-                        if results and not all("index" in r and "level" in r for r in results):
+                        if results and not all(isinstance(r, dict) and "index" in r and "level" in r for r in results):
                             print(f"    [{api_id}] 警告：JSON 陣列中缺少 index/level 字段")
                             print(f"    回傳內容前 200 字: {text[:200]}")
+                        results = _pad_eval_results(results, batch)
                         return results
             except Exception:
                 pass
@@ -355,7 +381,6 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
                 cd2 = _proofread_checkpoint_dir(output_dir, sheet_name)
                 cd2.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(cd2 / f"{tag}_{orig_bn:06d}_r{rnd}.json", json.dumps(part_data, ensure_ascii=False))
-                sync_progress(output_dir, sheet_name)
             _timestamp(f"P2-R{rnd} 批次 {orig_bn}/{total_batches} 完成 ({success_count} 條) [{cfg.api_id} {cfg.model}]")
         except Exception as e:
             es = str(e).lower()
@@ -377,7 +402,7 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
                         pass
 
     try:
-        await asyncio.gather(*[pool.submit(fbn, task, process_batch) for fbn, task in enumerate(all_tasks, 1)])
+        await asyncio.gather(*[pool.submit(fbn, task, process_batch, ctx=task) for fbn, task in enumerate(all_tasks, 1)])
     except RuntimeError as e:
         if "all APIs permanently disabled" in str(e):
             print("  ⚠️ 所有 API 已永久停用，Phase 2 評估中斷")
@@ -485,23 +510,28 @@ async def _polish_batch(client, model, batch, glossary, api_id):
                     results = [results]
                     print(f"    [{api_id}] 3 \u6b21\u5617\u8a66\u5747\u56de\u50b3\u55ae\u4e00\u7269\u4ef6\uff0c\u5f37\u5236\u4f7f\u7528")
                     print(f"    [{api_id}] \u26a0\ufe0f \u5982\u679c\u591a\u6b21\u986f\u793a\u6b64\u8a0a\u606f\uff0c\u4ee3\u8868\u6b64 API \u4e0d\u9069\u5408\u7ffb\u8b6f\u4efb\u52d9\uff0c\u5efa\u8b70\u5f9e .env \u79fb\u9664\u6216\u66f4\u63db\u6a21\u578b")
-            if isinstance(results, list):
-                results = results[:len(batch)]
-                for res, item in zip(results, batch):
-                    res["index"] = item.get("_idx", 0)
+            if isinstance(results, list) and len(results) > int(len(batch) * OVER_RETURN_TOLERANCE):
+                raise ValueError(f"回傳 {len(results)} 條，超過批次 {len(batch)} 的 {int(OVER_RETURN_TOLERANCE * 100)}%，視為失敗重試")
             if isinstance(results, dict):
                 results = [results]
+            if isinstance(results, list):
+                batch_indices = {item.get("_idx", 0) for item in batch}
+                mapped = {}
+                for r in results:
+                    if isinstance(r, dict) and r.get("index") in batch_indices:
+                        mapped[r["index"]] = r
+                results = list(mapped.values())
 
             if isinstance(results, list) and len(results) > 0:
                 success = sum(1 for r in results if isinstance(r, dict) and r.get("translation"))
-                rate = success / len(batch) if len(batch) > 0 else 0
+                rate = min(success, len(batch)) / len(batch) if len(batch) > 0 else 0
                 if rate < 0.75:
                     if attempt < 2:
                         print(f"    [{api_id}] \u26a0\ufe0f \u5b8c\u6210\u7387 {rate:.0%}\uff08{success}/{len(batch)}\uff09\u4f4e\u65bc 75%\uff0c\u91cd\u8a66")
                         raise ValueError(f"completion rate {rate:.0%} < 75%")
                     else:
                         print(f"    [{api_id}] \u26a0\ufe0f \u5b8c\u6210\u7387 {rate:.0%}\uff08{success}/{len(batch)}\uff09\u4f4e\u65bc 75%\uff0c\u5df2\u4f7f\u7528\u6240\u6709\u5617\u8a66")
-                null_count = sum(1 for r in results if r.get("translation") is None)
+                null_count = sum(1 for r in results if isinstance(r, dict) and r.get("translation") is None)
                 if null_count > len(results) * 0.5:
                     print(f"    [{api_id}] \u8b66\u544a\uff1a{null_count}/{len(results)} \u689d\u7ffb\u8b6f\u70ba null")
                 if results and not all("index" in r and "translation" in r for r in results):
@@ -521,19 +551,24 @@ async def _polish_batch(client, model, batch, glossary, api_id):
                             results = results["translations"]
                         elif "index" in results and "translation" in results:
                             raise ValueError("single object after repair, need array")
+                    if isinstance(results, list) and len(results) > int(len(batch) * OVER_RETURN_TOLERANCE):
+                        raise ValueError(f"回傳 {len(results)} 條，超過批次 {len(batch)} 的 {int(OVER_RETURN_TOLERANCE * 100)}%，視為失敗重試")
                     if isinstance(results, list):
-                        results = results[:len(batch)]
-                        for res, item in zip(results, batch):
-                            res["index"] = item.get("_idx", 0)
+                        batch_indices = {item.get("_idx", 0) for item in batch}
+                        mapped = {}
+                        for r in results:
+                            if isinstance(r, dict) and r.get("index") in batch_indices:
+                                mapped[r["index"]] = r
+                        results = list(mapped.values())
                         success = sum(1 for r in results if isinstance(r, dict) and r.get("translation"))
-                        rate = success / len(batch) if len(batch) > 0 else 0
+                        rate = min(success, len(batch)) / len(batch) if len(batch) > 0 else 0
                         if rate < 0.75:
                             if attempt < 2:
                                 print(f"    [{api_id}] ⚠️ 完成率 {rate:.0%}（{success}/{len(batch)}）低於 75%，重試")
                                 raise ValueError(f"completion rate {rate:.0%} < 75%")
                             else:
                                 print(f"    [{api_id}] ⚠️ 完成率 {rate:.0%}（{success}/{len(batch)}）低於 75%，已使用所有嘗試")
-                        null_count = sum(1 for r in results if r.get("translation") is None)
+                        null_count = sum(1 for r in results if isinstance(r, dict) and r.get("translation") is None)
                         if null_count > len(results) * 0.5:
                             print(f"    [{api_id}] 警告：{null_count}/{len(results)} 条翻译为 null")
                         if results and not all("index" in r and "translation" in r for r in results):
@@ -591,11 +626,6 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
     current_indices = sorted(all_indices)
 
     for rnd in range(MAX_ROUNDS):
-        if len(current_indices) <= 3:
-            if rnd > 0:
-                print(f"  P3 第 {rnd + 1} 轮：{len(current_indices)} 条剩余（少于3条，跳过）")
-            break
-
         pending = []
         for idx in current_indices:
             if idx not in df.index:
@@ -624,13 +654,22 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
             try:
                 results = await _polish_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
                 new_backup = {}
+                skipped = 0
                 for res in results:
+                    if not isinstance(res, dict):
+                        skipped += 1
+                        continue
                     idx = res.get("index")
                     trans = res.get("translation")
                     if idx is not None and trans is not None:
-                        df.at[idx, "translation"] = trans
-                        new_backup[str(idx)] = str(trans)
-                        all_backup[str(idx)] = str(trans)
+                        if idx in df.index:
+                            df.at[idx, "translation"] = trans
+                            new_backup[str(idx)] = str(trans)
+                            all_backup[str(idx)] = str(trans)
+                        else:
+                            skipped += 1
+                if skipped:
+                    print(f"  [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件或 index 不在工作表中），已忽略")
                 if new_backup:
                     save_backup_part(output_dir, tag, bn, new_backup, sheet_name)
                     sync_progress(output_dir, sheet_name)
@@ -791,6 +830,16 @@ def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_secon
             r1 = item["round1"]; r2 = item["round2"]
             detail = f"R1:{r1.get('level','?')}({r1.get('reason','')})|R2:{r2.get('level','?')}({r2.get('reason','')})"
             all_report_rows.append({"sheet_name": sheet_name, "english": eng, "original_translation": orig, "new_translation": new, "remark": f"Type2-{detail}"})
+    # Type1：P4a 重譯保護後仍存在的機械問題（術語/佔位符/未翻譯/空格）
+    for rdf in all_review_rows:
+        for _, row in rdf.iterrows():
+            all_report_rows.append({
+                "sheet_name": str(row.get("sheet_name", "")),
+                "english": str(row.get("english", "")),
+                "original_translation": str(row.get("current_translation", "")),
+                "new_translation": str(row.get("current_translation", "")),
+                "remark": f"Type1-{row.get('issue', '')}",
+            })
     if all_report_rows:
         rdf = pd.DataFrame(all_report_rows)
         rcols = ["sheet_name", "english", "original_translation", "new_translation", "remark"]
@@ -804,6 +853,7 @@ def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_secon
                 "glossary": PatternFill(start_color=Color(rgb="D9D9D9"), end_color=Color(rgb="D9D9D9"), fill_type="solid"),
                 "placeholder": PatternFill(start_color=Color(rgb="BDD7EE"), end_color=Color(rgb="BDD7EE"), fill_type="solid"),
                 "untranslated": PatternFill(start_color=Color(rgb="F4CCCC"), end_color=Color(rgb="F4CCCC"), fill_type="solid"),
+                "space": PatternFill(start_color=Color(rgb="E2EFDA"), end_color=Color(rgb="E2EFDA"), fill_type="solid"),
             }
             # Type2: 文字顏色標記（Type2-R1 部分藍字，其餘黑字）
             from openpyxl.cell.rich_text import CellRichText, TextBlock
@@ -868,7 +918,7 @@ def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_secon
     elapsed(overall_start, "總計")
 
 
-def _build_session_data(excel_path, glossary_path, glossary_sheets, current_sheet, completed_sheets, pending_sheets, sheet_configs, accumulated_review_rows=None):
+def _build_session_data(excel_path, glossary_path, glossary_sheets, current_sheet, completed_sheets, pending_sheets, sheet_configs, accumulated_review_rows=None, mode: str = "proofread"):
     session = {
         "excel_path": str(Path(excel_path).resolve()),
         "glossary_path": str(glossary_path) if glossary_path else None,
@@ -877,7 +927,7 @@ def _build_session_data(excel_path, glossary_path, glossary_sheets, current_shee
         "completed_sheets": list(completed_sheets),
         "pending_sheets": list(pending_sheets),
         "sheet_configs": sheet_configs,
-        "mode": "proofread",
+        "mode": mode,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     if accumulated_review_rows:
@@ -911,6 +961,9 @@ async def _proofread_phase3(sheet_name, st, glossary, workplace_str, pool):
 async def _proofread_phase4a(sheet_name, st, glossary, workplace_str, pool):
     df = st["df"]
     _timestamp(f"P4a 開始：{sheet_name}...")
+    restored = _restore_enforce_backup(df, workplace_str, sheet_name)
+    if restored > 0:
+        print(f"    從重譯 checkpoint 還原 {restored} 條修正")
     df, review_df = await retry_protect(df, glossary, workplace_str, sheet_name=sheet_name, pool=pool)
     st["df"] = df
     st["review_df"] = review_df
@@ -962,6 +1015,9 @@ async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names,
                 else:
                     df = df_original[df_original.index.isin(selected_indices)].copy()
                     df = _apply_polish_from_checkpoint(df, str(workplace), sheet_name)
+                    restored = _restore_enforce_backup(df, str(workplace), sheet_name)
+                    if restored > 0:
+                        print(f"    從重譯 checkpoint 還原 {restored} 條修正")
                     df, review_df = await retry_protect(df, glossary, str(workplace), sheet_name=sheet_name, pool=pool)
                     if not review_df.empty:
                         review_df.insert(0, "sheet_name", sheet_name)
@@ -1061,6 +1117,297 @@ async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names,
         all_review_rows, str(workplace), overall_start)
     _delete_proofread_checkpoint(str(workplace))
 
+
+# === 快速校對（重譯模式）===
+
+def _quick_checkpoint_dir(output_dir=None, sheet_name=None):
+    if output_dir:
+        base = Path(output_dir) / QUICK_CHECKPOINT_SUBDIR
+    else:
+        base = Path(__file__).parent / QUICK_CHECKPOINT_SUBDIR
+    if sheet_name:
+        base = base / _sanitize_sheet_name(sheet_name)
+    return base
+
+
+def _save_quick_session(output_dir, session_info):
+    cd = _quick_checkpoint_dir(output_dir)
+    cd.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(cd / SESSION_FILE, json.dumps(session_info, ensure_ascii=False, indent=2))
+
+
+def _load_quick_session(output_dir):
+    sf = _quick_checkpoint_dir(output_dir) / SESSION_FILE
+    if sf.exists():
+        try:
+            return json.loads(sf.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return None
+
+
+def _save_quick_sheet_translations(output_dir, sheet_name, translations):
+    cd = _quick_checkpoint_dir(output_dir, sheet_name)
+    cd.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(cd / "translations.json", json.dumps(translations, ensure_ascii=False))
+
+
+def _load_quick_sheet_translations(output_dir, sheet_name) -> dict:
+    f = _quick_checkpoint_dir(output_dir, sheet_name) / "translations.json"
+    if f.exists():
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_quick_sheet_review(output_dir, sheet_name, rows):
+    cd = _quick_checkpoint_dir(output_dir, sheet_name)
+    cd.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(cd / "review_rows.json", json.dumps(rows, ensure_ascii=False))
+
+
+def _load_quick_sheet_review(output_dir, sheet_name) -> list:
+    f = _quick_checkpoint_dir(output_dir, sheet_name) / "review_rows.json"
+    if f.exists():
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def _mark_quick_sheet_complete(output_dir, sheet_name):
+    cd = _quick_checkpoint_dir(output_dir, sheet_name)
+    cd.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(cd / "_all_done", json.dumps(
+        {"phase": "all", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}, ensure_ascii=False))
+
+
+def _is_quick_sheet_complete(output_dir, sheet_name) -> bool:
+    return (_quick_checkpoint_dir(output_dir, sheet_name) / "_all_done").exists()
+
+
+def _restore_enforce_backup(df, output_dir, sheet_name) -> int:
+    """把重譯（enforce）備份套回 df，僅在重譯確實被中斷時還原（依 enforce_tag 過濾 part）。"""
+    cp = Path(output_dir) / "_checkpoint" / _sanitize_sheet_name(sheet_name)
+    ecp = cp / "enforce_checkpoint.json"
+    if not ecp.exists():
+        return 0
+    try:
+        enforce_tag = json.loads(ecp.read_text(encoding="utf-8")).get("enforce_tag")
+    except Exception:
+        enforce_tag = None
+    if not enforce_tag:
+        return 0
+    backup = {}
+    for f in sorted(cp.glob(f"part_{enforce_tag}_*.json")):
+        try:
+            backup.update(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    restore_count = 0
+    for idx_str, trans in backup.items():
+        idx = int(idx_str)
+        if idx in df.index:
+            df.at[idx, "translation"] = trans
+            restore_count += 1
+    return restore_count
+
+
+async def _quick_phase4a(sheet_name, st, glossary, workplace_str, pool):
+    df = st["df"]
+    _timestamp(f"P4a 開始：{sheet_name}...")
+    restored = _restore_enforce_backup(df, workplace_str, sheet_name)
+    if restored > 0:
+        print(f"    從重譯 checkpoint 還原 {restored} 條修正")
+    df, review_df = await retry_protect(df, glossary, workplace_str, sheet_name=sheet_name, pool=pool)
+    st["df"] = df
+    st["review_df"] = review_df
+
+
+def generate_quick_reports(excel_path, all_translated_dfs, all_review_rows, output_dir, overall_start):
+    from openpyxl.styles import Color, PatternFill
+    out_path = Path(output_dir) / f"{Path(excel_path).stem}_quick_proofread_output.xlsx"
+    if all_translated_dfs:
+        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+            for s_name, df_s in all_translated_dfs.items():
+                df_s.to_excel(writer, index=False, sheet_name=s_name)
+        print(f"\n  快速校對輸出：{out_path}")
+
+    rp = Path(output_dir) / "quick_proofread_report.xlsx"
+    if all_review_rows:
+        combined = pd.concat(all_review_rows, ignore_index=True)
+    else:
+        combined = pd.DataFrame(columns=["sheet_name", "english", "current_translation", "category", "issue"])
+    with pd.ExcelWriter(rp, engine="openpyxl") as writer:
+        combined.to_excel(writer, index=False, sheet_name="Sheet1")
+        ws = writer.sheets["Sheet1"]
+        fill_glossary = PatternFill(start_color=Color(rgb="D9D9D9"), end_color=Color(rgb="D9D9D9"), fill_type="solid")
+        fill_placeholder = PatternFill(start_color=Color(rgb="BDD7EE"), end_color=Color(rgb="BDD7EE"), fill_type="solid")
+        fill_untranslated = PatternFill(start_color=Color(rgb="F4CCCC"), end_color=Color(rgb="F4CCCC"), fill_type="solid")
+        fill_space = PatternFill(start_color=Color(rgb="E2EFDA"), end_color=Color(rgb="E2EFDA"), fill_type="solid")
+        ic = None
+        for ci, cell in enumerate(ws[1], start=1):
+            if cell.value == "issue":
+                ic = ci
+                break
+        if ic:
+            for row in ws.iter_rows(min_row=2):
+                v = str(row[ic - 1].value) if row[ic - 1].value else ""
+                fill = (fill_glossary if v.startswith("[glossary]")
+                        else fill_placeholder if v.startswith("[placeholder]")
+                        else fill_untranslated if v.startswith("[untranslated]")
+                        else fill_space if v.startswith("[space]") else None)
+                if fill:
+                    for cell in row:
+                        cell.fill = fill
+    print(f"  quick_proofread_report.xlsx 已寫入：{rp}（{len(combined)} 條）")
+
+    qcp = _quick_checkpoint_dir(output_dir)
+    if qcp.exists():
+        import shutil
+        shutil.rmtree(qcp)
+        print(f"  已清除快速校對 checkpoint")
+    ecp = Path(output_dir) / "_checkpoint"
+    if ecp.exists():
+        import shutil
+        shutil.rmtree(ecp)
+        print(f"  已清除強制檢查 checkpoint")
+    elapsed(overall_start, "總計")
+
+
+async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_names, sheet_configs):
+    overall_start = datetime.now()
+    workplace = Path(excel_path).parent
+    _timestamp("正在備份目標檔案...")
+    backup_target_file(excel_path)
+    _timestamp("正在載入術語庫...")
+    t0 = datetime.now()
+    if str(glossary_path) == "__AUTO__":
+        glossary = auto_extract_glossary(excel_path, str(workplace))
+    else:
+        glossary = load_glossary(glossary_path, glossary_sheets)
+    elapsed(t0, "術語庫")
+    print(f"  術語庫載入完成：{len(glossary)} 條")
+
+    all_translated_dfs = {}
+    all_review_rows = []
+    completed_sheets = []
+    pending_sheets = list(sheet_names)
+    _save_quick_session(str(workplace), _build_session_data(
+        excel_path, glossary_path, glossary_sheets,
+        pending_sheets[0] if pending_sheets else "",
+        [], pending_sheets, sheet_configs, mode="quick_proofread"))
+
+    pool = SharedBatchPool()
+    try:
+        await pool.start()
+    except RuntimeError:
+        qcp = _quick_checkpoint_dir(str(workplace))
+        if qcp.exists():
+            import shutil
+            shutil.rmtree(qcp)
+        raise
+    active = [c for c in pool.api_configs if not c.is_permanently_disabled]
+    print(f"  已載入 {len(active)} 個可用 API：")
+    for cfg in active:
+        print(f"    {cfg.api_id} {cfg.model_provider}/{cfg.model} ({cfg.api_type}, 並發={cfg.parallel_limit})")
+
+    try:
+        sheet_states = {}
+        for sheet_name in pending_sheets:
+            df_original = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
+            print(f"    總行數：{len(df_original)}")
+            sheet_cfg = sheet_configs.get(sheet_name, {})
+            selected_indices = set(sheet_cfg.get("selected_indices", []))
+            if _is_quick_sheet_complete(str(workplace), sheet_name):
+                df_full = df_original.copy()
+                saved = _load_quick_sheet_translations(str(workplace), sheet_name)
+                restore_count = 0
+                for idx_str, trans in saved.items():
+                    idx = int(idx_str)
+                    if idx in df_full.index:
+                        df_full.at[idx, "translation"] = trans
+                        restore_count += 1
+                if restore_count > 0:
+                    print(f"    從 checkpoint 還原 {restore_count} 條修正")
+                rows = _load_quick_sheet_review(str(workplace), sheet_name)
+                if rows:
+                    all_review_rows.append(pd.DataFrame(rows))
+                    print(f"    還原 {len(rows)} 條審查記錄")
+                all_translated_dfs[sheet_name] = df_full
+                completed_sheets.append(sheet_name)
+                print(f"  已從 checkpoint 還原 {sheet_name}")
+                continue
+            if not selected_indices:
+                print(f"  {sheet_name} 未選取任何條目，跳過")
+                all_translated_dfs[sheet_name] = df_original
+                completed_sheets.append(sheet_name)
+                continue
+            df = df_original[df_original.index.isin(selected_indices)].copy()
+            sheet_states[sheet_name] = {"df_original": df_original, "df": df}
+
+        t = datetime.now()
+        _timestamp("Phase 4a：重譯修正（全部工作表並行）...")
+        results = await asyncio.gather(*[
+            _quick_phase4a(sheet_name, st, glossary, str(workplace), pool)
+            for sheet_name, st in sheet_states.items()
+        ], return_exceptions=True)
+        for sheet_name, res in zip(sheet_states, results):
+            if isinstance(res, BaseException):
+                if isinstance(res, RuntimeError) and "all APIs permanently disabled" in str(res):
+                    print("\n  ⚠️所有 API 已永久停用，快速校對中止")
+                raise res
+        elapsed(t, "P4a")
+
+        for sheet_name, st in sheet_states.items():
+            df = st["df"]
+            review_df = st["review_df"]
+            if review_df is not None and not review_df.empty:
+                review_df.insert(0, "sheet_name", sheet_name)
+                all_review_rows.append(review_df)
+            ecp = Path(str(workplace)) / "_checkpoint" / _sanitize_sheet_name(sheet_name) / "enforce_checkpoint.json"
+            if ecp.exists():
+                ecp.unlink()
+            st["df_original"].update(df)
+            all_translated_dfs[sheet_name] = st["df_original"]
+            saved = {}
+            for idx in df.index:
+                trans = df.at[idx, "translation"]
+                if trans is not None:
+                    saved[str(idx)] = str(trans)
+            _save_quick_sheet_translations(str(workplace), sheet_name, saved)
+            if review_df is not None and not review_df.empty:
+                _save_quick_sheet_review(str(workplace), sheet_name, review_df.to_dict(orient="records"))
+            _mark_quick_sheet_complete(str(workplace), sheet_name)
+            completed_sheets.append(sheet_name)
+            print(f"  {sheet_name} 完成")
+
+        pending_sheets.clear()
+        _save_quick_session(str(workplace), _build_session_data(
+            excel_path, glossary_path, glossary_sheets,
+            "", completed_sheets, pending_sheets, sheet_configs, mode="quick_proofread"))
+    finally:
+        await pool.close()
+
+    # Phase 4b：模板校正（在所有工作表完成後執行；TEMPLATES 為空時無作用）
+    t_p4b = datetime.now()
+    _timestamp("Phase 4b：模板校正...")
+    for sheet_name in all_translated_dfs:
+        sheet_cfg = sheet_configs.get(sheet_name, {})
+        selected_indices = set(sheet_cfg.get("selected_indices", []))
+        if not selected_indices:
+            continue
+        df_original = all_translated_dfs[sheet_name]
+        df = df_original[df_original.index.isin(selected_indices)].copy()
+        df = template_correction(df, glossary, str(workplace), sheet_name=sheet_name)
+        df_original.update(df)
+        all_translated_dfs[sheet_name] = df_original
+    elapsed(t_p4b, "P4b")
+
+    generate_quick_reports(excel_path, all_translated_dfs, all_review_rows, str(workplace), overall_start)
 
 def main():
     print("校對模組已載入。請使用 batch_proofread.py 執行 CLI。")

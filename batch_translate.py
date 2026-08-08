@@ -37,6 +37,25 @@ def elapsed(start: datetime, label: str):
     secs = (datetime.now() - start).total_seconds()
     print(f"  [{label}] 耗時: {secs:.1f} 秒")
 
+def filter_template_filled(pending, df):
+    """模板已處理（_status == 已處理）的條目從待翻譯清單移除，避免重複送 LLM。"""
+    if "_status" not in df.columns:
+        return pending
+    filled = set(df.index[df["_status"] == "已處理"])
+    return [p for p in pending if p["_idx"] not in filled]
+
+
+def validate_columns(excel_path, sheet_names, required=("english", "translation")) -> bool:
+    """檢查目標工作表是否具備必要欄位，避免後續 KeyError。"""
+    ok = True
+    for sn in sheet_names:
+        df = pd.read_excel(excel_path, sheet_name=sn, dtype=str)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print(f"  錯誤：工作表「{sn}」缺少必要欄位: {', '.join(missing)}")
+            ok = False
+    return ok
+
 
 def list_excel_files(directory: Path) -> list[Path]:
     if not directory.exists():
@@ -83,7 +102,8 @@ def choose_multi(items: list[str], title: str) -> list[str]:
             choice = input("\n請輸入編號（可多個以逗號分隔）: ").strip()
             if choice == "0":
                 return list(items)
-            indices = [int(x.strip()) for x in choice.split(",") if x.strip()]
+            raw_indices = [int(x.strip()) for x in choice.split(",") if x.strip()]
+            indices = list(dict.fromkeys(raw_indices))
             selected = [items[i-1] for i in indices if 1 <= i <= len(items)]
             if selected:
                 return selected
@@ -147,7 +167,7 @@ def step3(excel_path: Path) -> list[str]:
         return sheets
     return choose_multi(sheets, "選擇翻譯目標工作表：")
 
-def step4_choose_sheet_mode(untranslated_count: int) -> dict:
+def step4_choose_sheet_mode(untranslated_count: int, total_rows: int) -> dict:
     """
     選擇單一工作表的翻譯範圍模式。
     回傳模式 dict:
@@ -175,11 +195,16 @@ def step4_choose_sheet_mode(untranslated_count: int) -> dict:
             try:
                 rng = input("  請輸入行數範圍（如 100-500）: ").strip()
                 parts = rng.split("-")
-                s, e = int(parts[0]) - 1, int(parts[1])
-                print(f"  選取行 {s+1} 到 {e}")
+                if len(parts) != 2:
+                    raise ValueError
+                s = int(parts[0]) - 1
+                e = int(parts[1])
+                if not (0 <= s < e <= total_rows):
+                    raise ValueError
+                print(f"  選取行 {s + 1} 到 {e}")
                 return {"type": "range", "start": s, "end": e}
             except (ValueError, IndexError):
-                print("  無效範圍")
+                print(f"  無效範圍（請輸入 1 到 {total_rows} 之間的正向範圍）")
         else:
             print("  無效輸入")
 
@@ -381,6 +406,7 @@ async def _run_translation_pipeline(excel_path, workplace, glossary, glossary_pa
             matched = int((df["_status"] == "已處理").sum())
             elapsed(t2, "模板比對")
             print(f"    模板匹配完成: {matched} 條已處理")
+            pending = filter_template_filled(pending, df)
             pending_count = int((df["translation"].isna() | (df["translation"] == "nan")).sum())
             print(f"    待翻譯: {pending_count} 條")
             sheet_states[sheet_name] = {"df_full": df_full, "df": df, "pending": pending}
@@ -542,6 +568,9 @@ async def main():
     workplace = _get_workplace()
     glossary_path, glossary_sheets = step2(exclude_path=excel_path)
     sheet_names = step3(excel_path)
+    if not validate_columns(excel_path, sheet_names):
+        input("\n按 Enter 關閉...")
+        return
 
     overall_start = datetime.now()
     t0 = datetime.now()
@@ -569,7 +598,7 @@ async def main():
         print(f"\n{SEP}")
         print(f"  設定工作表：{sn}（{uc} 條未翻譯）")
         print(SEP)
-        sn_mode = step4_choose_sheet_mode(uc)
+        sn_mode = step4_choose_sheet_mode(uc, len(cached_dfs[sn]))
         df_filtered = step4_apply_mode(cached_dfs[sn], sn_mode)
         sheet_configs[sn] = {
             "mode": sn_mode,

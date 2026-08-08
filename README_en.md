@@ -12,7 +12,10 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 7/8/2026, see [Changelog](Changelog.md) for details
+## Latest Update on 8/8/2026, see [Changelog](Changelog.md) for details
+- **Quick Proofread mode**: retranslation fixes only (terminology/placeholder/untranslated/spacing), skipping fluency evaluation and polishing
+- **Over-return policy**: returns exceeding 120% of the batch size fail and go through 3 retry attempts; results are mapped by index, adopting only current-batch indices
+- **Retranslation 429 handling now matches main translation**: cooldown/permanent-disable and job requeue
 - **Multi-worksheet parallelism**: Both translation and proofreading now process all worksheets in parallel within each phase, with a phase barrier between phases
 - **Shared batch pool**: Added shared_pool.py - one set of API configs, concurrency and 429 state for the whole run; each API spawns parallel_limit workers
 - **Unified timeout constant**: Added API_TIMEOUT (default 3600s)
@@ -38,8 +41,8 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 | File | Purpose |
 |---|---------------------------------|
 | `batch_translate.py` | **Main translation script** — interactive entry point |
-| `batch_proofread.py` | **Proofreading script** — interactive entry point |
-| `proofreader.py` | **Proofreading core module** — LLM dual-round evaluation + polishing + retranslation protection |
+| `batch_proofread.py` | **Proofreading script** — interactive entry point (Full / Quick) |
+| `proofreader.py` | **Proofreading core module** — LLM dual-round evaluation + polishing + retranslation protection (incl. quick/retranslation mode) |
 | `glossary.py` | Reads terminology Excel or auto-extracts glossary from target + outputs review file |
 | `tm_matcher.py` | Template matching (**not yet enabled**, will be added in the official release) |
 | `llm_translator.py` | **AI batch translation core**, async parallel calls, with smart JSON extraction and json_repair fallback |
@@ -55,6 +58,7 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 > - `_proofread_checkpoint/` — Proofreading-specific checkpoint, independent from main translation
 > - `_proofread_backup/` — Proofreading backup
 > - `_debugmessage/` — Low translation rate debug logs (auto-generated, displayed and cleared on next startup)
+> - `_quick_checkpoint/` — Quick proofread resume checkpoint (isolated from full proofreading, auto-deleted after completion)
 
 
 ### Pipeline
@@ -75,6 +79,14 @@ batch_proofread.py → multiple worksheets in parallel (phase barrier):
 ③ Phase 4a: Retranslation Protection (all worksheets in parallel)
 ④ Phase 4b: Template Correction (executed after all worksheets)
 ⑤ Generate Reports
+```
+
+```
+Quick Proofread (retranslation mode)
+batch_proofread.py → after choosing "Quick Proofread", only:
+① Phase 4a: Retranslation fixes (terminology/placeholder/untranslated/spacing, all worksheets in parallel)
+② Phase 4b: Template Correction
+③ Generate Reports (quick_proofread_report.xlsx)
 ```
 
 ---
@@ -145,7 +157,7 @@ Step 1: Select target Excel  → Lists all .xlsx files under workplace/
 Step 2: Select glossary      → Choose a glossary Excel, auto-extract from target's name/manual sheets, or skip (built-in ADD_LIST only)
 Step 3: Select worksheets    → Single or multiple
 Step 4: Select range         → All untranslated / First N for testing / Specify row range
-Step 5: Confirm execution    → Shows summary, press Y to confirm
+Step 5: Confirm execution      → Full proofreading (Phase 2→3→4a→4b→Reports); Quick proofreading (Phase 4a→4b→Reports)
 ```
 
 ### Output After Execution (Translation)
@@ -167,6 +179,7 @@ Place the translated Excel into `workplace/` and run `batch_proofread.py`.
 ### Interactive Steps (Proofreading)
 
 ```
+Step 0: Select proofread mode → [1] Full / [2] Quick (retranslation fixes only)
 Step 1: Select target Excel    → Lists all .xlsx files under workplace/
 Step 2: Select glossary (required) → Choose a glossary Excel or auto-extract (proofreading requires a glossary, cannot skip)
 Step 3: Select worksheet       → Choose the worksheet to proofread
@@ -182,6 +195,9 @@ Step 5: Confirm execution      → Starts proofreading (Phase 2→3→4a→4b→
 | `proofread_report.xlsx` | **Proofreading summary report** (Type1/Type2 color-coded) |
 | `review_report_proofread.xlsx` | **Retranslation protection review details** |
 | `_proofread_checkpoint/` | **Checkpoint resume temp directory**, located in `workplace/` (auto-deleted after completion) |
+| `{source_name}_quick_proofread_output.xlsx` | **Quick-proofread Excel file** (retranslation fixes only) |
+| `quick_proofread_report.xlsx` | **Quick proofread report** (four mechanical issue types, color-coded) |
+| `_quick_checkpoint/` | **Quick proofread resume temp directory**, located in `workplace/` (auto-deleted after completion) |
 
 ---
 
@@ -191,7 +207,7 @@ If the translation/proofreading is interrupted due to network issues, API errors
 
 **Resume workflow:**
 1. Re-run `batch_translate.py` / `batch_proofread.py`
-2. The script automatically scans `workplace/_checkpoint/session.json` (translation) or `workplace/_proofread_checkpoint/session.json` (proofreading) to detect unfinished progress
+2. The script automatically scans `workplace/_checkpoint/session.json` (translation), `workplace/_proofread_checkpoint/session.json` (full proofreading) or `workplace/_quick_checkpoint/session.json` (quick proofreading) to detect unfinished progress
 3. Displays a summary of the last translation settings (Excel, worksheet, progress)
 4. Asks whether to resume:
 
@@ -321,8 +337,8 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 **Q: After running, `ImportError: No module named 'openai'` appears**
 <br>A: Dependencies not installed. Run `pip install openai pandas openpyxl python-dotenv json-repair`.
 
-**Q: `ValueError: Please set the API_KEY environment variable or set it in the .env file` appears**
-<br>A: You forgot to create the `.env` file. Copy `.env.example` to `.env` and fill in your API Key.
+**Q: `no available API` appears (or "0 available APIs loaded")**
+<br>A: The `.env` file is missing or its settings are invalid (missing API_KEY / MODEL / BASE_URL). Copy `.env.example` to `.env` and fill in your API Key; the script also prints warnings listing which fields are missing per API.
 
 **Q: API requests keep failing or timing out**
 <br>A: Check that `BASE_URL` and `MODEL` in `.env` are correct. If using OpenRouter, verify your account balance is sufficient. You can also try lowering the concurrency of your main/fallback APIs to reduce rate limit risk.
@@ -355,7 +371,7 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 ### Checkpoint Resume Related
 
 **Q: Progress is not detected when resuming**
-<br>A: Resume depends on `workplace/_checkpoint/session.json`. If you manually moved files, you need to move the entire `_checkpoint/` directory together. If `session.json` was manually deleted, the resume feature will not work.
+<br>A: Translation depends on `workplace/_checkpoint/session.json`, full proofreading on `workplace/_proofread_checkpoint/session.json`, and quick proofreading on `workplace/_quick_checkpoint/session.json`. When moving files, move the matching directory as a whole; deleting `session.json` disables resume.
 
 **Q: Translations from a completed sheet are missing after resume**
 <br>A: Resume automatically restores data from completed sheets. If the interruption occurred during translation, simply re-run the script to continue from the interrupted sheet.
@@ -372,7 +388,7 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 <br>A: The API lacks sufficient translation capability — only 1 out of 94 entries was successfully translated. Check the debug files in `workplace/_debugmessage/` to review the full response and consider switching to a different model.
 
 **Q: The message `[APIx] ⚠️ API returned a single object instead of an array` appears**
-<br>A: The API does not support batch responses, returning only a single item. If this message appears repeatedly, consider removing it from `.env` or switching to another
+<br>A: The API does not support batch responses, returning only a single item. If this message appears repeatedly, consider removing it from `.env` or switching to another model.
 
 **Q: The message `JSON repair successful` appears**
 <br>A: The model's response contained minor JSON formatting issues (e.g., missing commas or colons). `json_repair` has automatically fixed them — no impact on translation results.
@@ -383,10 +399,13 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 <br>A: The 75% completion rate check is a normal mechanism in the proofreading phase. It automatically retries up to 3 attempts. If still below 75% after 3 tries, it accepts the result and logs debug info.
 
 **Q: What are Type1 and Type2 in the proofreading report?**
-<br>A: Type1 refers to terminology/placeholder/untranslated issues that can be automatically detected by scripts, marked with background colors. Type2 refers to fluency issues found by LLM dual-round evaluation — entries judged acceptable in both rounds are skipped.
+<br>A: Type1 refers to terminology/placeholder/untranslated issues that can be automatically detected by scripts, marked with background colors. Type2 refers to fluency issues found by LLM dual-round evaluation — only (acceptable, acceptable), (acceptable, mild) and (mild, acceptable) are skipped; mild + mild is still sent for polishing.
 
 **Q: Can proofreading handle multiple worksheets?**
 <br>A: Yes. Proofreading processes multiple worksheets concurrently within each phase, with a phase barrier between phases.
+
+**Q: What is the difference between Quick and Full proofreading?**
+<br>A: Quick proofreading only performs retranslation fixes (terminology/placeholder/untranslated/spacing) and skips P2 fluency evaluation and P3 polishing, so it is faster; outputs are `_quick_proofread_output.xlsx` and `quick_proofread_report.xlsx`.
 
 ---
 

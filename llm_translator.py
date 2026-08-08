@@ -4,7 +4,7 @@ from datetime import datetime
 import pandas as pd
 from dotenv import load_dotenv
 from glossary import normalize_term
-from api_config import API_TIMEOUT
+from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
 
 load_dotenv()
 
@@ -229,9 +229,18 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                     results = [results]
                     print(f"    [{api_id}] 3 次嘗試均回傳單一物件，強制使用")
                     print(f"    [{api_id}] ⚠️ 如果多次顯示此訊息，代表此 API 不適合翻譯任務，建議從 .env 移除或更換模型")
+            if isinstance(results, list):
+                if len(results) > int(len(batch) * OVER_RETURN_TOLERANCE):
+                    raise ValueError(f"回傳 {len(results)} 條，超過批次 {len(batch)} 的 {int(OVER_RETURN_TOLERANCE * 100)}%，視為失敗重試")
+                batch_indices = {item["_idx"] for item in batch}
+                mapped = {}
+                for r in results:
+                    if isinstance(r, dict) and r.get("index") in batch_indices:
+                        mapped[r["index"]] = r
+                results = list(mapped.values())
             if isinstance(results, list) and len(results) > 0:
                 success = sum(1 for r in results if isinstance(r, dict) and r.get("translation"))
-                rate = success / len(batch) if len(batch) > 0 else 0
+                rate = min(success, len(batch)) / len(batch) if len(batch) > 0 else 0
                 if rate < 0.25:
                     debug_dir = Path(__file__).parent / "workplace" / "_debugmessage"
                     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -249,7 +258,7 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                         }, ensure_ascii=False, indent=2), encoding="utf-8")
                     print(f"    [{api_id}] ⚠️ 低翻譯率 {rate:.1%}（{success}/{len(batch)}），已儲存 debug 訊息")
             if isinstance(results, list) and len(results) > 0:
-                null_count = sum(1 for r in results if r.get("translation") is None)
+                null_count = sum(1 for r in results if isinstance(r, dict) and r.get("translation") is None)
                 if null_count > len(results) * 0.5:
                     print(f"    [{api_id}] 警告：{null_count}/{len(results)} 條翻譯為 null")
             if isinstance(results, list):
@@ -336,16 +345,26 @@ async def translate_sheet_phase(df, glossary, output_dir, pending, sheet_name, p
     async def _process_batch(ws, job):
         cfg = ws["cfg"]
         batch_num, batch = job.batch_num, job.batch
+        batch_indices = {item["_idx"] for item in batch}
         _timestamp(f"[{sheet_name}] 批次 {batch_num}/{total_batches} 開始 ({len(batch)} 条) [{cfg.api_id} {cfg.model}]")
         try:
             results = await _translate_batch(ws["client"], cfg.model, batch, glossary, cfg.api_id)
             new_backup = {}
+            skipped = 0
             for res in results:
+                if not isinstance(res, dict):
+                    skipped += 1
+                    continue
                 idx = res.get("index")
                 trans = res.get("translation")
                 if idx is not None and trans is not None:
-                    df.at[idx, "translation"] = trans
-                    new_backup[str(idx)] = str(trans)
+                    if idx in batch_indices:
+                        df.at[idx, "translation"] = trans
+                        new_backup[str(idx)] = str(trans)
+                    else:
+                        skipped += 1
+            if skipped:
+                print(f"    [{cfg.api_id}] 警告：{skipped} 條回傳無效（非物件或 index 不在工作表中），已忽略")
             if new_backup:
                 save_backup_part(output_dir, session_tag, batch_num, new_backup, sheet_name)
                 sync_progress(output_dir, sheet_name)

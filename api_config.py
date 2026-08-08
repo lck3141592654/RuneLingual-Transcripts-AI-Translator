@@ -23,6 +23,9 @@ API_TIMEOUT = 3600
 # 429 停用次數：累計第 N 次 429 後永久停用（預設 2，可自行調整）
 PERMANENT_DISABLE_AFTER = 2
 
+# 過量回傳容許比例：回傳數超過批次數的這個比例即視為該批次失敗（走 3 輪重試）
+OVER_RETURN_TOLERANCE = 1.2
+
 
 @dataclass
 class ApiConfig:

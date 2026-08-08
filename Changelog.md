@@ -68,7 +68,7 @@
 - 新增校對管線（proofreader.py + batch_proofread.py）：
   - 三階段流程：LLM 雙輪評估（Phase 2）→ LLM 潤色（Phase 3）→ 重譯保護（Phase 4a）+ 模板校正（Phase 4b）
   - Phase 2 混合 R1+R2 批次池：R1 和 R2 的所有批次混合在一個 worker pool 中處理，而非順序執行兩輪
-  - 雙輪交叉驗證：僅有兩次皆為 {沒問題, 輕度} 的任意組合才跳過，其餘列為第二類問題條目
+  - 雙輪交叉驗證：僅有 (沒問題,沒問題)、(沒問題,輕度)、(輕度,沒問題) 三種組合才跳過，其餘（含兩輪皆輕度）列為第二類問題條目
   - 75% 完成率閾值：所有 API 回傳（含正常路徑與 json_repair 修復路徑）皆檢查，低於 75% 即重試，最高優先級
   - 互動式 CLI，支援續傳、debug 訊息檢視、備份與雙報告輸出（proofread_report.xlsx + review_report_proofread.xlsx）
   - 獨立 checkpoint 目錄（_proofread_checkpoint/），不與主翻譯干擾
@@ -85,7 +85,7 @@
 - Added proofreading pipeline (proofreader.py + batch_proofread.py):
   - Three-phase flow: LLM Dual-round Evaluation (Phase 2) → LLM Polish (Phase 3) → Retry Protect (Phase 4a) + Template Correction (Phase 4b)
   - Phase 2 mixed R1+R2 batch pool: all R1 and R2 batches processed in one worker pool instead of sequential passes
-  - Dual-round cross-validation: skips only when both rounds are {acceptable, mild} in any combination; all others flagged as category 2
+  - Dual-round cross-validation: skips only for (acceptable, acceptable), (acceptable, mild) and (mild, acceptable); all others (including mild + mild) are flagged as category 2
   - 75% completion rate threshold: checked on all API returns (normal path + json_repair path), triggers retry below 75%, highest priority
   - Interactive CLI with resume, debug message review, backup, and dual report output (proofread_report.xlsx + review_report_proofread.xlsx)
   - Isolated checkpoint directory (_proofread_checkpoint/) independent from main translation
@@ -141,3 +141,57 @@
 - Completed the four-color review report: the merged report now colors space issues green
 - Unified atomic checkpoint writes via atomic_write_text (.tmp -> fsync -> rename) for session/progress/part/enforce/phase markers/template/P2/P3 files
 - Removed dead code: run_worker_pool, translate_all, enforce sync wrapper and unused imports/functions/variables
+
+## 8/8/2026 v0.3.2 -> v0.4.0
+### 中文
+- 新增「快速校對」模式（重譯模式）：只執行重譯修正（術語/佔位符/未翻譯/空格 + 最多 3 輪 LLM 重譯），跳過 P2 流暢度評估與 P3 潤色
+  - batch_proofread.py 開頭可選 [1] 完整校對 / [2] 快速校對；使用獨立 checkpoint `_quick_checkpoint` 與續傳
+  - 輸出 `{來源}_quick_proofread_output.xlsx` + `quick_proofread_report.xlsx`（僅四類機械問題、四色標記）
+- 修正完整校對 P2 因共享批次池 submit 未傳 ctx 而無法執行的 bug
+- 重譯階段的 429 處理與主翻譯一致：立刻向外拋出，由共享池執行冷卻/永久停用與批次重排
+- 統一「過量回傳」政策：
+  - 新增 OVER_RETURN_TOLERANCE = 1.2：回傳數超過批次數 120% 即視為該批次失敗，走 3 輪重試
+  - 四條 LLM 路徑（翻譯/重譯/評估/潤色）統一依模型回傳的 index 對號入座，只採用屬於當前批次的 index；跨批次或不存在一律忽略，重複 index 後寫覆蓋
+  - 完成率分母統一為 min(成功數, 批次數)/批次數，rate 恆 ≤100%
+- 校對與續傳修正：
+  - P4a 重譯續傳只在存在 enforce_checkpoint 時還原，且只還原 enforce_tag 對應的 part 檔案
+  - P2 不再誤動翻譯 checkpoint（移除 sync_progress 呼叫）
+  - 評估回傳不足時以「严重」補位，避免漏報
+  - 潤色在第二類問題 ≤3 條時也會執行
+  - proofread_report.xlsx 加入 Type1 列（術語/佔位符/未翻譯/空格四色標記）
+  - 重譯修正率以同口徑計算（空格問題不再拖低修正率）
+- 回傳資料防護：LLM 回傳非 dict 或 index 不屬於當前批次時跳過並警告，不再整批失敗
+- 字串 "nan"/"nat"/"none" 視為未翻譯
+- 互動與輸入：
+  - 主翻譯 step4 行數範圍校驗（拒絕負數/反轉/超出總行數）
+  - choose_multi 去除重複編號
+  - 校對確認畫面顯示「自動萃取」而非 __AUTO__
+  - 模式與舊 session 不一致時先詢問是否清除舊進度；無可用 API 時清除殘留 session
+  - 目標 Excel 缺少 english/translation 欄位時明確報錯
+- 模板比對：模板填入翻譯的條目不再重複送 LLM
+### English
+- Added "Quick Proofread" mode (retranslation mode): only retranslation fixes (terminology/placeholder/untranslated/spacing + up to 3 LLM rounds), skipping P2 fluency evaluation and P3 polishing
+  - batch_proofread.py now offers [1] Full / [2] Quick proofread; isolated `_quick_checkpoint` with resume
+  - Outputs `{source}_quick_proofread_output.xlsx` + `quick_proofread_report.xlsx` (four mechanical issue types, color-coded)
+- Fixed full proofreading P2 crash caused by a missing ctx in shared pool submit
+- Retranslation 429 handling now matches main translation: re-raised immediately, handled by shared pool cooldown/permanent-disable and job requeue
+- Unified over-return policy:
+  - New OVER_RETURN_TOLERANCE = 1.2: returns exceeding 120% of the batch size are treated as batch failure and go through 3 retry attempts
+  - All four LLM paths (translate/retry/eval/polish) map results by the model-returned index, adopting only indices belonging to the current batch; cross-batch or unknown indices are ignored; duplicate indices use last-write-wins
+  - Completion rate denominator unified to min(success, batch)/batch, so the rate is always <= 100%
+- Proofreading and resume fixes:
+  - Enforce resume restores part files only when enforce_checkpoint exists, and only for its enforce_tag
+  - P2 no longer touches the translation checkpoint (removed sync_progress call)
+  - Eval pads missing items with "severe" to avoid under-reporting
+  - Polish now runs even with <= 3 second-category items
+  - proofread_report.xlsx now includes Type1 rows (four mechanical types, color-coded)
+  - Retranslation correction rate uses a consistent scope (space issues no longer drag it down)
+- Response robustness: non-dict results or indices not belonging to the current batch are skipped with a warning instead of failing the whole batch
+- String "nan"/"nat"/"none" treated as untranslated
+- Interaction and input:
+  - Translation range input validated (negative/reversed/out-of-bounds rejected)
+  - choose_multi deduplicates repeated numbers
+  - Proofread confirmation shows "auto-extract" instead of __AUTO__
+  - Mode/session mismatch asks before clearing old progress; leftover quick session is cleaned when no API is available
+  - Missing english/translation columns are reported clearly
+- Template matching: template-filled entries are no longer re-sent to the LLM
