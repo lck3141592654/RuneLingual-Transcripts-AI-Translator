@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime
 import pandas as pd
 from dotenv import load_dotenv
-from glossary import normalize_term
+from glossary import normalize_term, find_term_spans, build_relevance_context
 from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
 
 load_dotenv()
@@ -43,14 +43,10 @@ SYSTEM_PROMPT_BASE = (
 def get_relevant_glossary(batch, glossary):
     """只回傳當前批次有出現的術語（含複數歸一化匹配）。"""
     batch_text = " ".join(item.get("english", "") for item in batch).lower()
+    _ctx = build_relevance_context(batch_text)
     term_matches = []
     for eng, chn in glossary.items():
-        eng_pat = r"(?<![a-z'])" + re.escape(eng.lower()) + r"(?![a-z'])"
-        spans = [m.span() for m in re.finditer(eng_pat, batch_text)]
-        norm = normalize_term(eng)
-        if norm != eng.lower():
-            norm_pat = r"(?<![a-z'])" + re.escape(norm) + r"(?![a-z'])"
-            spans.extend([m.span() for m in re.finditer(norm_pat, batch_text)])
+        spans = find_term_spans(eng, batch_text, _ctx)
         if spans:
             term_matches.append((eng, chn, spans))
     if not term_matches:
@@ -67,6 +63,23 @@ def get_relevant_glossary(batch, glossary):
             relevant.append((eng, chn))
             covered_spans.extend(spans)
     return relevant
+
+def is_missing_translation(value, english: str | None = None) -> bool:
+    """Determine whether a translation cell should be treated as missing.
+    String "nan"/"nat"/"none" counts as missing unless the source text is exactly that word.
+    """
+    if value is None:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    s = str(value).strip()
+    if not s:
+        return True
+    if s.lower() in ("nan", "nat", "none"):
+        if english is None or str(english).strip().lower() not in ("nan", "nat", "none"):
+            return True
+    return False
+
 
 def _sanitize_sheet_name(name: str) -> str:
     """將工作表名稱轉換為安全的目錄名稱。"""
@@ -321,7 +334,7 @@ def prepare_sheet_translation(df: pd.DataFrame, output_dir=None, sheet_name=None
         df["translation"] = None
     pending = []
     for idx, row in df.iterrows():
-        if pd.isna(row.get("translation")) or row["translation"] is None:
+        if is_missing_translation(row.get("translation")):
             pending.append({
                 "_idx": idx,
                 "english": str(row["english"]),

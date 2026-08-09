@@ -9,7 +9,7 @@ from copy import deepcopy
 import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
-from glossary import load_glossary, auto_extract_glossary
+from glossary import load_glossary, auto_extract_glossary, find_term_spans, build_relevance_context
 from tm_matcher import match_and_fill
 from llm_translator import (
     _group_into_batches, _sanitize_sheet_name,
@@ -310,7 +310,7 @@ def _load_phase2_category(output_dir, sheet_name, df):
     result = []
     for idx_str, r1r in r1.items():
         idx = int(idx_str)
-        r2r = r2.get(idx_str, {"level": "没问题", "reason": ""})
+        r2r = r2.get(idx_str, {"level": "严重", "reason": "评估缺失，预设为严重"})
         if _cross_reference(r1r, r2r):
             if idx in df.index:
                 row = df.loc[idx]
@@ -416,7 +416,7 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
     second_category = []
     for idx_str, r1r in round1_results.items():
         idx = int(idx_str)
-        r2r = round2_results.get(idx_str, {"level": "没问题", "reason": ""})
+        r2r = round2_results.get(idx_str, {"level": "严重", "reason": "评估缺失，预设为严重"})
         if _cross_reference(r1r, r2r):
             if idx in df.index:
                 row = df.loc[idx]
@@ -771,14 +771,14 @@ async def retry_protect(df, glossary, output_dir, sheet_name=None, pool=None):
     import pandas as pd
     # Compute relevant glossary (same logic as enforcer.enforce())
     all_text = " ".join(str(row.get("english", "")).lower() for _, row in df.iterrows())
+    _ctx = build_relevance_context(all_text)
     relevant_glossary = {
         e: c for e, c in glossary.items()
-        if re.search(r"(?<![a-z'])" + re.escape(e.lower()) + r"(?![a-z'])", all_text)
+        if find_term_spans(e, all_text, _ctx)
     }
-    glossary_text = chr(10).join([f"  {e} → {c}" for e, c in relevant_glossary.items()]) if relevant_glossary else "  无"
     # Run retry directly in current event loop with the shared pool
     if pool is not None:
-        df = await _enforce_async(df, relevant_glossary, glossary_text, output_dir=output_dir, sheet_name=sheet_name, shared_pool=pool)
+        df = await _enforce_async(df, relevant_glossary, output_dir=output_dir, sheet_name=sheet_name, shared_pool=pool)
     # Final scan (same as enforcer.enforce())
     final_pool = scan_issues(df, relevant_glossary)
     review_rows = []
@@ -931,8 +931,23 @@ def _build_session_data(excel_path, glossary_path, glossary_sheets, current_shee
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     if accumulated_review_rows:
-        session["accumulated_review_rows"] = len(accumulated_review_rows)
+        # 與 batch_translate 一致：存完整內容（dict 清單），而非只存數量
+        rows = []
+        for df in accumulated_review_rows:
+            for _, r in df.iterrows():
+                rows.append(r.to_dict())
+        session["accumulated_review_rows"] = rows
     return session
+
+
+def _remove_session_file(output_dir) -> None:
+    """完成後清除 session，避免已完成的工作表再次觸發續傳提示。"""
+    for sf in (_proofread_checkpoint_dir(output_dir) / SESSION_FILE, _quick_checkpoint_dir(output_dir) / SESSION_FILE):
+        if sf.exists():
+            try:
+                sf.unlink()
+            except OSError:
+                pass
 
 
 async def _proofread_phase2(sheet_name, st, glossary, workplace_str, pool):
@@ -969,7 +984,7 @@ async def _proofread_phase4a(sheet_name, st, glossary, workplace_str, pool):
     st["review_df"] = review_df
 
 
-async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names, sheet_configs):
+async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names, sheet_configs, session=None):
     overall_start = datetime.now()
     workplace = Path(excel_path).parent
     _timestamp("正在備份目標檔案...")
@@ -986,6 +1001,9 @@ async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names,
     all_original_dfs = {}
     all_second_category = {}
     all_review_rows = []
+    if session and session.get("accumulated_review_rows"):
+        all_review_rows.append(pd.DataFrame(session["accumulated_review_rows"]))
+        print(f"    還原 {len(session['accumulated_review_rows'])} 條審查記錄")
     completed_sheets = []
     pending_sheets = list(sheet_names)
     _save_session(str(workplace), _build_session_data(
@@ -1116,6 +1134,7 @@ async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names,
         all_second_category,
         all_review_rows, str(workplace), overall_start)
     _delete_proofread_checkpoint(str(workplace))
+    _remove_session_file(str(workplace))
 
 
 # === 快速校對（重譯模式）===
@@ -1278,7 +1297,7 @@ def generate_quick_reports(excel_path, all_translated_dfs, all_review_rows, outp
     elapsed(overall_start, "總計")
 
 
-async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_names, sheet_configs):
+async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_names, sheet_configs, session=None):
     overall_start = datetime.now()
     workplace = Path(excel_path).parent
     _timestamp("正在備份目標檔案...")
@@ -1294,6 +1313,9 @@ async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_
 
     all_translated_dfs = {}
     all_review_rows = []
+    if session and session.get("accumulated_review_rows"):
+        all_review_rows.append(pd.DataFrame(session["accumulated_review_rows"]))
+        print(f"    還原 {len(session['accumulated_review_rows'])} 條審查記錄")
     completed_sheets = []
     pending_sheets = list(sheet_names)
     _save_quick_session(str(workplace), _build_session_data(
@@ -1408,6 +1430,7 @@ async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_
     elapsed(t_p4b, "P4b")
 
     generate_quick_reports(excel_path, all_translated_dfs, all_review_rows, str(workplace), overall_start)
+    _remove_session_file(str(workplace))
 
 def main():
     print("校對模組已載入。請使用 batch_proofread.py 執行 CLI。")

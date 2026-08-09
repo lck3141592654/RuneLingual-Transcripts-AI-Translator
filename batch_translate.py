@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from glossary import load_glossary
 from tm_matcher import match_and_fill
-from llm_translator import prepare_sheet_translation, translate_sheet_phase
+from llm_translator import prepare_sheet_translation, translate_sheet_phase, is_missing_translation
 from llm_translator import save_session, delete_checkpoint_files, load_backup
 from enforcer import enforce_async
 from shared_pool import SharedBatchPool
@@ -210,7 +210,7 @@ def step4_choose_sheet_mode(untranslated_count: int, total_rows: int) -> dict:
 
 def step4_apply_mode(df_full: pd.DataFrame, mode: dict) -> pd.DataFrame:
     """根據預選模式對特定工作表的 DataFrame 套用範圍。"""
-    untranslated_mask = df_full["translation"].isna() | (df_full["translation"].isnull())
+    untranslated_mask = df_full["translation"].apply(is_missing_translation)
     if mode["type"] == "all":
         return df_full[untranslated_mask].copy()
     elif mode["type"] == "first_n":
@@ -390,7 +390,7 @@ async def _run_translation_pipeline(excel_path, workplace, glossary, glossary_pa
                 completed_sheets.append(sheet_name)
                 continue
             mask = df_full.index.isin(selected_indices) & (
-                df_full["translation"].isna() | (df_full["translation"].isnull())
+                df_full["translation"].apply(is_missing_translation)
             )
             df = df_full[mask].copy()
             remaining = len(df)
@@ -407,7 +407,7 @@ async def _run_translation_pipeline(excel_path, workplace, glossary, glossary_pa
             elapsed(t2, "模板比對")
             print(f"    模板匹配完成: {matched} 條已處理")
             pending = filter_template_filled(pending, df)
-            pending_count = int((df["translation"].isna() | (df["translation"] == "nan")).sum())
+            pending_count = int(df["translation"].apply(is_missing_translation).sum())
             print(f"    待翻譯: {pending_count} 條")
             sheet_states[sheet_name] = {"df_full": df_full, "df": df, "pending": pending}
 
@@ -561,6 +561,7 @@ async def main():
                                                     all_translated_dfs, all_review_rows)
 
             _write_outputs(excel_path, workplace, all_translated_dfs, all_review_rows, overall_start)
+            delete_checkpoint_files(str(workplace))
             return
 
     # ── 全新翻譯路徑 ──
@@ -635,6 +636,7 @@ async def main():
                                             all_translated_dfs, all_review_rows)
 
     _write_outputs(excel_path, workplace, all_translated_dfs, all_review_rows, overall_start)
+    delete_checkpoint_files(str(workplace))
 
 
 if __name__ == "__main__":

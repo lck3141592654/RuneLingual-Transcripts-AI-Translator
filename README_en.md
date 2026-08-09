@@ -12,7 +12,17 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 8/8/2026, see [Changelog](Changelog.md) for details
+## Latest Update on 9/8/2026, see [Changelog](Changelog.md) for details
+- **Space-check fixes**: English text is no longer mangled; only English parentheses and Chinese punctuation spacing are processed, and Latin/CJK mixed spacing (e.g. 屠龙者 I 任务) is no longer flagged
+- **Term matching rewrite**: new `find_term_spans()` accepts only exact terms or genuine plurals; News no longer matches new, The Face no longer matches face; singular words no longer match plural terms (bus ≠ Buses)
+- **ADD_LIST keep-original fix**: RuneLingual, OSRS, etc. (translation = source) are no longer flagged as untranslated
+- **"nan"/"nat"/"none" string fix**: no longer skipped by the translation stage
+- **Retranslation prompt slimming**: each batch now carries only its own terms, avoiding token overflow
+- **Proofread resume hardening**: review rows stored in full, missing R2 defaults to "severe", session cleared after completion
+- **Glossary guard**: empty english cells no longer leak 'nan' entries
+- **Performance**: scanning a 21,000+ term glossary dropped from ~18s to ~2.5s
+
+**v0.4.0 (8/8/2026)**:
 - **Quick Proofread mode**: retranslation fixes only (terminology/placeholder/untranslated/spacing), skipping fluency evaluation and polishing
 - **Over-return policy**: returns exceeding 120% of the batch size fail and go through 3 retry attempts; results are mapped by index, adopting only current-batch indices
 - **Retranslation 429 handling now matches main translation**: cooldown/permanent-disable and job requeue
@@ -157,7 +167,7 @@ Step 1: Select target Excel  → Lists all .xlsx files under workplace/
 Step 2: Select glossary      → Choose a glossary Excel, auto-extract from target's name/manual sheets, or skip (built-in ADD_LIST only)
 Step 3: Select worksheets    → Single or multiple
 Step 4: Select range         → All untranslated / First N for testing / Specify row range
-Step 5: Confirm execution      → Full proofreading (Phase 2→3→4a→4b→Reports); Quick proofreading (Phase 4a→4b→Reports)
+Step 5: Confirm execution      → Starts translation (template matching → LLM batch translation → terminology enforcement), then outputs the translated file and review report
 ```
 
 ### Output After Execution (Translation)

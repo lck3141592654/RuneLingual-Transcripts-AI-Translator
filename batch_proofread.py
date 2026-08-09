@@ -322,9 +322,9 @@ def main():
             elapsed(t0, "術語庫")
             print(f"  術語庫載入完成: {len(glossary)} 條")
             if exist_session.get("mode") == "quick_proofread":
-                asyncio.run(run_quick_proofread(excel_path, glossary_path, glossary_sheets, all_sheets, sheet_configs))
+                asyncio.run(run_quick_proofread(excel_path, glossary_path, glossary_sheets, all_sheets, sheet_configs, session=exist_session))
             else:
-                asyncio.run(run_proofread(excel_path, glossary_path, glossary_sheets, all_sheets, sheet_configs))
+                asyncio.run(run_proofread(excel_path, glossary_path, glossary_sheets, all_sheets, sheet_configs, session=exist_session))
             return
     # 全新執行
     excel_path = step1()

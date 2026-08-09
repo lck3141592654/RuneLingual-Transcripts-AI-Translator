@@ -6,8 +6,8 @@ from datetime import datetime
 
 load_dotenv()
 
-from glossary import normalize_term
-from llm_translator import BATCH_SIZE_LIMIT, atomic_write_text
+from glossary import ADD_LIST, normalize_term, find_term_spans, build_relevance_context
+from llm_translator import BATCH_SIZE_LIMIT, atomic_write_text, get_relevant_glossary, is_missing_translation
 from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
 from shared_pool import SharedBatchPool
 
@@ -22,23 +22,6 @@ RETRY_PROMPTS = [
     "如果术语表的人名、地名等名詞用'.'分隔，例如'索菲娅.休斯'，你必須使用'.'分隔，不要自行改為'·'或其他方式：",
 ]
 
-_re_cache: dict = {}
-
-
-def _cached_patterns(term: str):
-    """Cache compiled regex per glossary term; returns (pat, norm_pat)."""
-    cached = _re_cache.get(term)
-    if cached is None:
-        pat = re.compile(r"(?<![a-z'])" + re.escape(term.lower()) + r"(?![a-z'])")
-        norm = normalize_term(term)
-        norm_pat = None
-        if norm != term.lower():
-            norm_pat = re.compile(r"(?<![a-z'])" + re.escape(norm) + r"(?![a-z'])")
-        cached = (pat, norm_pat)
-        _re_cache[term] = cached
-    return cached
-
-
 def _find_matched_spans(eng_lower: str, glossary: dict) -> list:
     """對每條原文找出所有匹配到（詞邊界）的術語及其 span，按術語長度降序排列。
 
@@ -46,16 +29,20 @@ def _find_matched_spans(eng_lower: str, glossary: dict) -> list:
     """
     matches = []
     for eng, chn in glossary.items():
-        pat, norm_pat = _cached_patterns(eng)
-        spans = [m.span() for m in pat.finditer(eng_lower)]
-        if norm_pat is not None:
-            spans.extend([m.span() for m in norm_pat.finditer(eng_lower)])
+        spans = find_term_spans(eng, eng_lower)
         if spans:
             matches.append((eng, chn, spans))
     # 長術語優先處理（避免短術語被長術語覆蓋時誤報）
     matches.sort(key=lambda x: len(x[0]), reverse=True)
     return matches
 
+
+def build_retry_glossary_text(glossary: dict, batch: list) -> str:
+    """只把當前重譯批次實際出現的術語做成提示詞文字，避免整張工作表術語造成超 token。"""
+    relevant = get_relevant_glossary(batch, glossary)
+    if not relevant:
+        return "  无"
+    return "\n".join([f"  {e} → {c}" for e, c in relevant])
 
 
 def check_glossary_usage(english_text: str, translated_text: str, glossary: dict) -> list:
@@ -98,45 +85,58 @@ def check_placeholder(english_text: str, translated_text: str) -> list[str]:
     return issues
 
 
-def check_untranslated(english_text: str, translated_text) -> list[str]:
-    """檢查是否未成功翻譯，返回問題描述清單"""
+def check_untranslated(english_text: str, translated_text, keep_original_terms: set[str] | None = None) -> list[str]:
+    """檢查是否未成功翻譯，返回問題描述清單。
+
+    keep_original_terms：術語庫（ADD_LIST 等）明確要求保持原文的術語集合，
+    這些條目譯文與原文相同是「正確行為」，不視為未翻譯。
+    """
     issues = []
-    # 情況 A：translation 為空
-    if translated_text is None or (isinstance(translated_text, float) and pd.isna(translated_text)):
+    keep_original_terms = keep_original_terms or set()
+    eng_str = str(english_text).strip()
+    # 情況 A：translation 為空（含字串 nan/nat/none，但原文本身是這些字時除外）
+    if is_missing_translation(translated_text, english=eng_str):
         issues.append("translation 欄位為空")
         return issues
     trans_str = str(translated_text).strip()
-    if trans_str.lower() in ("nan", "nat", "none"):
-        issues.append("translation 欄位為空")
-        return issues
-    # 情況 B：譯文與原文相同（不分大小寫），且原文包含英文字母
-    if trans_str.lower() == english_text.strip().lower():
-        if re.search(r'[a-zA-Z]', english_text):
+    # 情況 B：譯文與原文相同（不分大小寫）
+    if trans_str.lower() == eng_str.lower():
+        # 原文本身是 nan/nat/none 這類字時，相同譯文是合法結果
+        if eng_str.lower() in ("nan", "nat", "none"):
+            return issues
+        # ADD_LIST 明確要求保持原文的術語：直接視為正確
+        if eng_str in keep_original_terms:
+            return issues
+        if re.search(r"[a-zA-Z]", eng_str):
             # 排除純佔位符條目：去除 [] 後只留下空白或標點符號時不視為未翻譯
-            stripped = re.sub(r'\[.*?\]', '', english_text).strip()
-            if stripped and re.search(r'[a-zA-Z]', stripped):
+            stripped = re.sub(r"\[.*?\]", "", eng_str).strip()
+            if stripped and re.search(r"[a-zA-Z]", stripped):
                 issues.append("譯文與原文相同，未實際翻譯")
     return issues
 
 
 def check_space_issues(translated_text: str) -> list:
-    """檢查譯文中的四種空格問題，回傳問題清單 list[(type, suggested_fix, desc)]"""
+    """檢查譯文中的空格問題，回傳問題清單 list[(type, suggested_fix, desc)]
+
+    英文半形標點的左右空格是正常英文格式，不列入問題；
+    只有英文括號（半形 ()）旁的空格屬於括號排版問題。
+    """
     issues = []
     if translated_text is None or (isinstance(translated_text, float) and pd.isna(translated_text)):
         return issues
     trans_str = str(translated_text)
-    if '  ' in trans_str:
+    if "  " in trans_str:
         issues.append(("space", "", "存在連續多個空格"))
-    if re.search(r'[\u4e00-\u9fff] [\u4e00-\u9fff]', trans_str):
+    if re.search(r"[\u4e00-\u9fff] [\u4e00-\u9fff]", trans_str):
         issues.append(("space", "", "中文字間不應有空格"))
-    if re.search(r' [\u4e00-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001]', trans_str):
+    if re.search(r" [\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001]", trans_str):
         issues.append(("space", "", "空格後不應直接接中文標點符號"))
-    if re.search(r'[\u4e00-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001] ', trans_str):
+    if re.search(r"[\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001] ", trans_str):
         issues.append(("space", "", "中文標點符號後不應有空格"))
-    if re.search(r' [\.!\?,;:]', trans_str):
-        issues.append(("space", "", "空格後不應直接接英文標點符號"))
-    if re.search(r'[\.!\?,;:] ', trans_str):
-        issues.append(("space", "", "英文標點符號後不應有空格"))
+    if re.search(r"\( | \)", trans_str):
+        issues.append(("space", "", "英文括號內側不應有空格"))
+    if re.search(r"[\u4e00-\u9fff] \(|\) [\u4e00-\u9fff]", trans_str):
+        issues.append(("space", "", "中文語境下英文括號外側不應有空格"))
     return issues
 
 
@@ -155,14 +155,25 @@ def fix_single_placeholder(english_text: str, translated_text: str) -> str:
 
 
 def fix_space_issues(text: str) -> str:
-    """清除四種不合格空格，保留正常空格"""
-    text = re.sub(r' {2,}', ' ', text)
-    text = re.sub(r'([\u4e00-\u9fff]) ([\u4e00-\u9fff])', r'\1\2', text)
-    text = re.sub(r' ([\u4e00-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001])', r'\1', text)
-    text = re.sub(r'([\u4e00-\u9fff\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001]) ', r'\1', text)
-    text = re.sub(r' [\.!\?,;:]', r'', text)
-    text = re.sub(r'[\.!\?,;:] ', r'', text)
+    """清除不合格空格，保留正常英文空格。
+
+    英文半形標點的前後空格是正常格式，絕不刪除；
+    英文括號（半形 ()）旁的空白屬於括號排版問題，會修正為緊貼括號。
+    """
+    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"([\u4e00-\u9fff]) ([\u4e00-\u9fff])", r"\1\2", text)
+    text = re.sub(r" ([\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001])", r"\1", text)
+    text = re.sub(r"([\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u300c\u300d\u300e\u300f\uff08\uff09\u3010\u3011\u300a\u300b\u2014\u2014\u2026\u2026\u00b7\u3001]) ", r"\1", text)
+    # 英文括號（半形 ()）：
+    # 1) 括號內側的空格一律移除（( word → (word、word ) → word)）
+    # 2) 括號外側的空格只在中文語境移除（中文前後緊貼括號）；英文句子保留正常空格
+    text = re.sub(r"\( ", "(", text)
+    text = re.sub(r" \)", ")", text)
+    text = re.sub(r"([\u4e00-\u9fff]) \(", r"\1(", text)
+    text = re.sub(r"\) ([\u4e00-\u9fff])", r")\1", text)
     return text
+
+
 def preprocess_issues(df, pool):
     """對問題條目進行腳本預處理（單佔位符修正 + 空格修正），直接修改 df"""
     for idx, row, issues in pool:
@@ -178,6 +189,7 @@ def preprocess_issues(df, pool):
     return df
 def scan_issues(df, relevant_glossary) -> list[tuple]:
     """走訪所有行，彙整三種檢查的結果，回傳問題 pool"""
+    keep_original_terms = {k for k, v in ADD_LIST.items() if v.strip().lower() == str(k).strip().lower()}
     pool = []
     for idx, row in df.iterrows():
         eng = str(row.get("english", ""))
@@ -185,7 +197,7 @@ def scan_issues(df, relevant_glossary) -> list[tuple]:
         all_issues = []
 
         # 未翻譯檢查（包含空值情況）
-        untrans_issues = check_untranslated(eng, trans)
+        untrans_issues = check_untranslated(eng, trans, keep_original_terms=keep_original_terms)
         if untrans_issues:
             for ui in untrans_issues:
                 all_issues.append(("untranslated", "", ui))
@@ -220,13 +232,14 @@ def _filter_llm_pool(pool):
     return [item for item in pool if any(itype != "space" for itype, _, _ in item[2])]
 
 
-async def _retry_round(client, model_name, pool, glossary_text, rnd):
+async def _retry_round(client, model_name, pool, glossary, rnd):
     """非同步執行一輪重譯，返回修正後的條目數"""
     # 每批 BATCH_SIZE_LIMIT（100）條，無群組機制
     all_results = []
     for bs in range(0, len(pool), BATCH_SIZE_LIMIT):
         batch = pool[bs:bs + BATCH_SIZE_LIMIT]
         items = [{"index": idx, "english": str(row["english"])} for idx, row, _ in batch]
+        glossary_text = build_retry_glossary_text(glossary, items)
         prompt = (RETRY_PROMPTS[rnd] + "\n" + json.dumps(items, ensure_ascii=False)
                   + f"\n## 强制术语表（请严格使用以下翻译）\n{glossary_text}"
                   + "\n请回传 JSON 阵列，每条包含 index 和 translation。")
@@ -283,7 +296,7 @@ async def _retry_round(client, model_name, pool, glossary_text, rnd):
             mapped[r["index"]] = r
     return list(mapped.values())
 
-async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, sheet_name=None, shared_pool=None):
+async def _enforce_async(df, relevant_glossary, output_dir=None, sheet_name=None, shared_pool=None):
     """非同步執行重譯循環，使用多 API 共享隊列模式（支援續傳）"""
     from llm_translator import save_backup_part, _sanitize_sheet_name
     import uuid
@@ -382,7 +395,7 @@ async def _enforce_async(df, relevant_glossary, glossary_text, output_dir=None, 
             cfg = ws["cfg"]
             batch_slice = job.batch
             try:
-                results = await _retry_round(ws["client"], cfg.model, batch_slice, glossary_text, rnd)
+                results = await _retry_round(ws["client"], cfg.model, batch_slice, relevant_glossary, rnd)
                 batch_indices = {item[0] for item in batch_slice}
                 fixed = 0
                 skipped = 0
@@ -471,15 +484,15 @@ async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path
 
     # 只保留對當前批次有相關性的術語
     all_text = " ".join(str(row.get("english", "")).lower() for _, row in df.iterrows())
+    _ctx = build_relevance_context(all_text)
     relevant_glossary = {
         e: c for e, c in glossary.items()
-        if re.search(r"(?<![a-z'])" + re.escape(e.lower()) + r"(?![a-z'])", all_text)
+        if find_term_spans(e, all_text, _ctx)
     }
-    glossary_text = "\n".join([f"  {e} → {c}" for e, c in relevant_glossary.items()]) if relevant_glossary else "  无"
 
     # 非同步重譯（使用共享池；未提供時建立臨時池）
     if shared_pool is not None:
-        df = await _enforce_async(df, relevant_glossary, glossary_text, output_dir, sheet_name, shared_pool)
+        df = await _enforce_async(df, relevant_glossary, output_dir, sheet_name, shared_pool)
     else:
         tmp_pool = SharedBatchPool()
         try:
@@ -488,7 +501,7 @@ async def enforce_async(df: pd.DataFrame, glossary: dict, output_dir: str | Path
             tmp_pool = None
         if tmp_pool is not None:
             try:
-                df = await _enforce_async(df, relevant_glossary, glossary_text, output_dir, sheet_name, tmp_pool)
+                df = await _enforce_async(df, relevant_glossary, output_dir, sheet_name, tmp_pool)
             finally:
                 await tmp_pool.close()
 

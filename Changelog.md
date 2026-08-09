@@ -169,6 +169,7 @@
   - 模式與舊 session 不一致時先詢問是否清除舊進度；無可用 API 時清除殘留 session
   - 目標 Excel 缺少 english/translation 欄位時明確報錯
 - 模板比對：模板填入翻譯的條目不再重複送 LLM
+
 ### English
 - Added "Quick Proofread" mode (retranslation mode): only retranslation fixes (terminology/placeholder/untranslated/spacing + up to 3 LLM rounds), skipping P2 fluency evaluation and P3 polishing
   - batch_proofread.py now offers [1] Full / [2] Quick proofread; isolated `_quick_checkpoint` with resume
@@ -195,3 +196,39 @@
   - Mode/session mismatch asks before clearing old progress; leftover quick session is cleaned when no API is available
   - Missing english/translation columns are reported clearly
 - Template matching: template-filled entries are no longer re-sent to the LLM
+
+## 9/8/2026 v0.4.0 -> v0.4.1
+
+### 中文
+- 修正術語庫混入 'nan' 條目：name/manual 或術語庫工作表中 english 為空的列，原本會因 str(NaN) 變成 'nan' 而塞進術語庫（例如 'nan' → '无'）；現在會跳過空 english 列；同時修正 pd.ExcelFile 未關閉導致 Windows 下檔案被鎖的問題
+- 修正空格檢查誤報中英混排空格：「空格後不應直接接中文標點符號」與「中文標點符號後不應有空格」的字元類別原本包含所有中文字（\u4e00-\u9fff），導致「屠龙者 I 任务」這類英文與中文之間的空格被誤判為標點問題；改為只匹配中文標點後，中英混排空格保留且不再誤報，真正的標點空格（如「任务 。」）仍會標記並修正
+- 修正空格修正破壞英文文本：`fix_space_issues()` / `check_space_issues()` 不再刪除英文標點（. , ! ? ; :）前後空格，只處理英文半形括號內側空格與中文語境下的括號外側空格（例如 `Mr. Smith. Hello` 不再變成 `MrSmithHello`）
+- 修正術語歸一化誤報：`normalize_term()` 不再剝離 a/an/the 開頭冠詞；新增 `find_term_spans()` 取代歸一化正則匹配，只接受「術語原樣」或「文字詞是術語的真正複數變形」（boxes→Box、demons→Demon）；News 不再誤配 new、The Face 不再誤配 face、Boxes 不再誤配 box
+- 方向性複數匹配：文字詞必須是術語的複數形態（支援 -s/-es/-ies/-ves 與不規則變形），單數詞不會誤配複數術語（bus 不會誤配 Buses）
+- 修正 ADD_LIST 同字條目誤報：RuneLingual、OSRS、RuneLite、Old School RuneScape 等「譯文 = 原文」的術語不再被視為未翻譯，由腳本直接填入、不送 LLM
+- 修正字串 "nan"/"nat"/"none" 被翻譯階段漏掉：新增 `is_missing_translation()`，翻譯範圍選取、待翻譯清單、未翻譯檢查三處行為一致
+- 重譯提示詞不再超 token：`_retry_round()` 每個批次只帶該批次實際出現的術語（批次級），不再把整張工作表的術語塞進提示詞
+- 修正複數形態術語被相關性過濾排除：`enforce_async()` 與 `retry_protect()` 的術語篩選改用 `find_term_spans()`，僅以複數形態出現的術語也會納入檢查與重譯
+- 效能優化：新增 `build_relevance_context()` 預先建立文本詞集合與複數對照（每張工作表或批次只建立一次），21,000+ 術語大表掃描從約 18 秒降至約 2.5 秒
+- 多字詞術語定位修正：以位置比對回傳真實 span，詞與詞之間只能有空白，分散的詞不再誤配（"ape ... atoll" 不誤配 Ape Atoll）
+- 修正校對續傳審查記錄只存數量不存內容：`_build_session_data()` 改為存完整 dict 清單，續傳時還原審查記錄
+- 修正 P2 部分完成續傳漏報：R2 缺失預設從「没问题」統一改為「严重」，與 `_pad_eval_results()` 一致
+- 續傳路徑一致性：翻譯與校對完成後清除 session 檔，避免已完成的執行再次觸發續傳提示；續傳時審查記錄完整還原
+- IGNORE_LIST 補齊冠詞形態與裸詞（Goblin、Wall、Rock、Desert、Container、Corpse、Crack 等），維持移除冠詞剝離後的過濾行為與舊版一致
+
+### English
+- Fixed 'nan' entries leaking into the glossary: rows with empty english cells in name/manual sheets or glossary workbooks were turned into 'nan' by str(NaN) and added to the glossary (e.g. 'nan' -> 无); empty english rows are now skipped; also fixed pd.ExcelFile handles not being closed, which locked files on Windows
+- Fixed space-check false positives on Latin/CJK mixed spacing: the "space before Chinese punctuation" and "space after Chinese punctuation" character classes previously included all CJK characters (\u4e00-\u9fff), so spaces between Latin and Chinese text (e.g. 屠龙者 I 任务) were wrongly flagged; the classes now match Chinese punctuation only, mixed spacing is preserved, and real punctuation spacing (e.g. 任务 。) is still flagged and fixed
+- Fixed the space-correction step destroying English text: `fix_space_issues()` / `check_space_issues()` no longer strip spaces around English punctuation (. , ! ? ; :); they only remove spaces inside English parentheses and around parentheses in Chinese context (e.g. `Mr. Smith. Hello` is no longer mangled into `MrSmithHello`)
+- Fixed term-normalization false positives: `normalize_term()` no longer strips leading a/an/the; new `find_term_spans()` replaces normalization-based matching and only accepts an exact term or a genuine plural of it (boxes→Box, demons→Demon); News no longer matches new, The Face no longer matches face, Boxes no longer matches box
+- Directional plural matching: a text word must be an actual plural form of the term (supports -s/-es/-ies/-ves and irregular forms); singular words no longer match plural terms (bus does not match Buses)
+- Fixed false untranslated flags for ADD_LIST keep-original entries (RuneLingual, OSRS, RuneLite, Old School RuneScape): filled by the script directly instead of being sent to the LLM
+- Fixed literal "nan"/"nat"/"none" strings being skipped by the translation stage: new `is_missing_translation()` unifies range selection, pending-list building and untranslated checks
+- Retranslation prompts no longer risk exceeding the token limit: `_retry_round()` includes only the terms that actually appear in each batch instead of the whole sheet glossary
+- Fixed plural-only terms being dropped by the relevance filter: `enforce_async()` and `retry_protect()` now filter via `find_term_spans()`, so terms appearing only in plural form are checked and retried
+- Performance: new `build_relevance_context()` precomputes the text word set and plural map once per sheet or batch; scanning a 21,000+ term glossary dropped from ~18s to ~2.5s
+- Multi-word term spans now point at the real occurrence (words must be adjacent with only whitespace between them); scattered words no longer match (an "ape ... atoll" sentence no longer matches Ape Atoll)
+- Proofreading session now stores the full review rows (list of dicts) instead of only a count, and restores them on resume
+- Fixed P2 partial-completion under-reporting on resume: missing R2 now defaults to "severe" consistently with `_pad_eval_results()`
+- Resume consistency: translation and proofreading now clear the session file after completion so a finished run no longer prompts for resume; review rows are restored fully on resume
+- IGNORE_LIST completed with article forms and bare forms (Goblin, Wall, Rock, Desert, Container, Corpse, Crack, etc.) so filtering behavior stays identical to the previous version after removing article stripping
