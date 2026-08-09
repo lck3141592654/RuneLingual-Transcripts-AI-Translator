@@ -22,17 +22,6 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 - **Glossary guard**: empty english cells no longer leak 'nan' entries
 - **Performance**: scanning a 21,000+ term glossary dropped from ~18s to ~2.5s
 
-**v0.4.0 (8/8/2026)**:
-- **Quick Proofread mode**: retranslation fixes only (terminology/placeholder/untranslated/spacing), skipping fluency evaluation and polishing
-- **Over-return policy**: returns exceeding 120% of the batch size fail and go through 3 retry attempts; results are mapped by index, adopting only current-batch indices
-- **Retranslation 429 handling now matches main translation**: cooldown/permanent-disable and job requeue
-- **Multi-worksheet parallelism**: Both translation and proofreading now process all worksheets in parallel within each phase, with a phase barrier between phases
-- **Shared batch pool**: Added shared_pool.py - one set of API configs, concurrency and 429 state for the whole run; each API spawns parallel_limit workers
-- **Unified timeout constant**: Added API_TIMEOUT (default 3600s)
-- **429 disable threshold constant**: Added PERMANENT_DISABLE_AFTER (default 2)
-- **Atomic checkpoint writes**: All checkpoints now use .tmp -> fsync -> rename atomic writes
-- **Four-color review report**: The merged review report now colors space issues green
-
 ### Features
 
 - **Ultra-low cost**: With DeepSeek V4 Flash, translating ~75,000 dialogue entries costs approximately **$2.39 USD**
