@@ -12,15 +12,16 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 9/8/2026, see [Changelog](Changelog.md) for details
-- **Space-check fixes**: English text is no longer mangled; only English parentheses and Chinese punctuation spacing are processed, and Latin/CJK mixed spacing (e.g. 屠龙者 I 任务) is no longer flagged
-- **Term matching rewrite**: new `find_term_spans()` accepts only exact terms or genuine plurals; News no longer matches new, The Face no longer matches face; singular words no longer match plural terms (bus ≠ Buses)
-- **ADD_LIST keep-original fix**: RuneLingual, OSRS, etc. (translation = source) are no longer flagged as untranslated
-- **"nan"/"nat"/"none" string fix**: no longer skipped by the translation stage
-- **Retranslation prompt slimming**: each batch now carries only its own terms, avoiding token overflow
-- **Proofread resume hardening**: review rows stored in full, missing R2 defaults to "severe", session cleared after completion
-- **Glossary guard**: empty english cells no longer leak 'nan' entries
-- **Performance**: scanning a 21,000+ term glossary dropped from ~18s to ~2.5s
+## Latest Update on 10/8/2026, see [Changelog](Changelog.md) for details
+- **Dict responses in retry path**: wrapped keys, nested structures and single objects are now parsed consistently with the other LLM paths
+- **Empty responses treated as failures**: all four LLM paths (translate/retry/eval/polish) retry 3 times when the response is empty or no index matches, instead of silently completing with 0 items
+- **"First N" negative guard**: the test-range input rejects negative numbers, with an apply-side guard
+- **.env loading fix**: now loaded from the script directory, so API settings work regardless of the working directory
+- **Windows file-lock fix**: Excel files opened in the interactive menus are always closed via `with`
+- **Consistent untranslated counts**: stats and actual checks both use `is_missing_translation()`
+- **Prompt sanitization**: NaN values are no longer sent to the model as invalid JSON
+- **Proofreading resume hardening**: declining resume / mode switch clears the shared checkpoint; P2 evaluation resumes at batch level; P3 re-sends failed entries and merges results across rounds
+- **No more hang when all APIs are disabled**: `submit()` raises immediately and the CLIs show a friendly message before exiting
 
 ### Features
 

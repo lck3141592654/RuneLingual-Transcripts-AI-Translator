@@ -232,3 +232,37 @@
 - Fixed P2 partial-completion under-reporting on resume: missing R2 now defaults to "severe" consistently with `_pad_eval_results()`
 - Resume consistency: translation and proofreading now clear the session file after completion so a finished run no longer prompts for resume; review rows are restored fully on resume
 - IGNORE_LIST completed with article forms and bare forms (Goblin, Wall, Rock, Desert, Container, Corpse, Crack, etc.) so filtering behavior stays identical to the previous version after removing article stripping
+
+## 10/8/2026 v0.4.1 -> v0.4.2
+
+### 中文
+- 重譯路徑支援 dict 回傳：新增 `_extract_retry_results()`，統一處理包裝 key（translations/translated/data/results）、巢狀結構與單一物件，與主翻譯/評估/潤色路徑一致
+- 空回傳視為失敗：四條 LLM 路徑（翻譯/重譯/評估/潤色）在回傳為空或 index 全數不匹配時進入 3 輪重試，不再靜默當作完成 0 條
+- 主翻譯「僅測試前 N 條」拒絕負數輸入，套用端另加防呆
+- `.env` 改以腳本所在目錄載入（api_config / llm_translator / enforcer），不再依賴啟動工作目錄
+- 互動選單與校對的 `pd.ExcelFile` 一律改用 `with` 關閉，避免 Windows 檔鎖
+- 未翻譯統計改與 `is_missing_translation()` 同口徑
+- 提示詞中的 NaN 空值改為 null（`_json_safe`），避免送出無效 JSON
+- 移除未使用的 `_is_plural_like()`
+- 校對續傳強化：
+  - 拒絕續傳 / 模式切換時一併清空共用 `_checkpoint`，避免殘留 enforce checkpoint 污染下一次執行
+  - P2 評估改為批次級續傳（`phase2_progress.json` + part 檔還原），中斷後只重送未完成批次
+  - P3 潤色記錄 `failed_indices`，失敗條目在下一輪與續傳都會重送
+  - P3 checkpoint 改為累積合併各輪結果，續傳不再遺失先前輪次的潤色成果
+- 全 API 永久停用時 `submit()` 立即拋錯，兩個 CLI 頂層顯示友善提示後正常結束（不再卡死）
+
+### English
+- Retry path now handles dict responses (wrapped keys / nested structures / single objects) consistently with the other LLM paths
+- Empty or fully-filtered responses are treated as failures on all four LLM paths (3-attempt retry), no longer silently completing with 0 items
+- "First N" translation range rejects negative input, with an apply-side guard
+- .env is now loaded from the script directory (api_config / llm_translator / enforcer) instead of the working directory
+- Interactive `pd.ExcelFile` usage now uses `with` (batch_translate / batch_proofread) to avoid Windows file locks
+- Untranslated counts now use `is_missing_translation()` consistently
+- NaN values in prompts are converted to null (`_json_safe`) to avoid invalid JSON
+- Removed unused `_is_plural_like()`
+- Proofreading resume hardening:
+  - Declining resume / mode switch now clears the shared `_checkpoint` to avoid stale enforce checkpoints
+  - P2 evaluation resumes at batch level (`phase2_progress.json` + part-file restore), only re-sending unfinished batches
+  - P3 polish records `failed_indices`, so failed entries are re-sent in later rounds and on resume
+  - P3 checkpoint now merges results across rounds, so earlier rounds are not lost on resume
+- `submit()` raises immediately when all APIs are permanently disabled; both CLIs show a friendly message and exit cleanly (no more hang)

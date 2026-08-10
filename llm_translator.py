@@ -6,9 +6,21 @@ from dotenv import load_dotenv
 from glossary import normalize_term, find_term_spans, build_relevance_context
 from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 BATCH_SIZE_LIMIT = 100
+
+def _json_safe(value):
+    """把 NaN 等 pandas 空值轉成 None，避免在提示詞中產生無效 JSON。"""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float) and pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
 
 CHECKPOINT_SUBDIR = "_checkpoint"
 PROGRESS_FILE = "progress.json"
@@ -180,7 +192,7 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
 
     user_content = json.dumps([
         {"index": item["_idx"], "english": item["english"],
-         "notes": item.get("notes"), "wiki_url": item.get("wiki_url")}
+         "notes": _json_safe(item.get("notes")), "wiki_url": _json_safe(item.get("wiki_url"))}
         for item in batch
     ], ensure_ascii=False)
 
@@ -251,6 +263,8 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                     if isinstance(r, dict) and r.get("index") in batch_indices:
                         mapped[r["index"]] = r
                 results = list(mapped.values())
+                if not results:
+                    raise ValueError("回傳為空或無匹配的 index，視為失敗重試")
             if isinstance(results, list) and len(results) > 0:
                 success = sum(1 for r in results if isinstance(r, dict) and r.get("translation"))
                 rate = min(success, len(batch)) / len(batch) if len(batch) > 0 else 0
@@ -298,14 +312,22 @@ async def _translate_batch(client, model_name, batch, glossary, api_id="?"):
                     if repaired:
                         results = json.loads(repaired)
                         print(f"    [{api_id}] ⚠️ JSON 修復成功")
+                        if isinstance(results, dict) and "translations" in results:
+                            results = results["translations"]
                         if isinstance(results, list):
+                            if not results:
+                                raise ValueError("回傳為空，視為失敗重試")
+                            if len(results) > int(len(batch) * OVER_RETURN_TOLERANCE):
+                                raise ValueError(f"回傳 {len(results)} 條，超過批次 {len(batch)} 的 {int(OVER_RETURN_TOLERANCE * 100)}%，視為失敗重試")
+                            batch_indices = {item["_idx"] for item in batch}
+                            mapped = {}
+                            for r in results:
+                                if isinstance(r, dict) and r.get("index") in batch_indices:
+                                    mapped[r["index"]] = r
+                            results = list(mapped.values())
+                            if not results:
+                                raise ValueError("回傳為空或無匹配的 index，視為失敗重試")
                             return results
-                        if isinstance(results, dict):
-                            if "translations" in results:
-                                return results["translations"]
-                            # 修復後是單一物件 → 照一般流程處理
-                            if "index" in results and "translation" in results:
-                                raise ValueError("single object after repair, need array")
                 except Exception:
                     pass
             # ↑ 修復結束

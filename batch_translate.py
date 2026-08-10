@@ -150,8 +150,8 @@ def step2(exclude_path: Path | None = None) -> tuple[Path | None, list[str] | No
     if c == len(fnames):
         return AUTO_GLOSSARY_SENTINEL, None
     gp = xlsx_files[c - 1]
-    xls = pd.ExcelFile(gp)
-    sheets = xls.sheet_names
+    with pd.ExcelFile(gp) as xls:
+        sheets = xls.sheet_names
     if len(sheets) == 1:
         print(f"  自動使用工作表: {sheets[0]}")
         return gp, sheets
@@ -161,8 +161,8 @@ def step2(exclude_path: Path | None = None) -> tuple[Path | None, list[str] | No
 
 def step3(excel_path: Path) -> list[str]:
     """step3：選擇翻譯目標工作表。"""
-    xls = pd.ExcelFile(excel_path)
-    sheets = xls.sheet_names
+    with pd.ExcelFile(excel_path) as xls:
+        sheets = xls.sheet_names
     if len(sheets) == 1:
         return sheets
     return choose_multi(sheets, "選擇翻譯目標工作表：")
@@ -187,10 +187,14 @@ def step4_choose_sheet_mode(untranslated_count: int, total_rows: int) -> dict:
         elif c == "2":
             try:
                 n = int(input("  請輸入 N: ").strip())
-                print(f"  選取前 {n} 條未翻譯")
-                return {"type": "first_n", "n": n}
             except ValueError:
                 print("  無效數字")
+                continue
+            if n < 1:
+                print("  N 必須是 1 以上的正整數")
+                continue
+            print(f"  選取前 {n} 條未翻譯")
+            return {"type": "first_n", "n": n}
         elif c == "3":
             try:
                 rng = input("  請輸入行數範圍（如 100-500）: ").strip()
@@ -214,7 +218,8 @@ def step4_apply_mode(df_full: pd.DataFrame, mode: dict) -> pd.DataFrame:
     if mode["type"] == "all":
         return df_full[untranslated_mask].copy()
     elif mode["type"] == "first_n":
-        idx = list(df_full.index[untranslated_mask][:mode["n"]])
+        n = mode["n"] if mode["n"] >= 0 else 0
+        idx = list(df_full.index[untranslated_mask][:n])
         return df_full.loc[idx].copy() if idx else df_full.iloc[:0].copy()
     elif mode["type"] == "range":
         return df_full.iloc[mode["start"]:mode["end"]].copy()
@@ -589,7 +594,10 @@ async def main():
     cached_dfs = {}
     for sn in sheet_names:
         df_temp = pd.read_excel(excel_path, sheet_name=sn, dtype=str)
-        uc = int(df_temp["translation"].isna().sum()) if "translation" in df_temp.columns else len(df_temp)
+        if "translation" in df_temp.columns:
+            uc = int(df_temp["translation"].apply(is_missing_translation).sum())
+        else:
+            uc = len(df_temp)
         sheet_untranslated.append((sn, uc))
         cached_dfs[sn] = df_temp
 
@@ -642,6 +650,16 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except RuntimeError as e:
+        if "all APIs permanently disabled" in str(e):
+            print("\n  ⚠️ 所有 API 已永久停用（兩次 429 限流），無法繼續。")
+            print("  已儲存部分翻譯進度，請檢查 API Key 後重新執行即可續傳。")
+            input("\n按 Enter 關閉...")
+        else:
+            print(f"\n發生錯誤: {e}")
+            import traceback
+            traceback.print_exc()
+            input("\n按 Enter 關閉...")
     except Exception as e:
         print(f"\n發生錯誤: {e}")
         import traceback

@@ -58,6 +58,8 @@ class SharedBatchPool:
         ]
 
     async def submit(self, batch_num, batch, func, ctx=None):
+        if all(c.is_permanently_disabled for c in self.api_configs):
+            raise RuntimeError("all APIs permanently disabled")
         fut = self._loop.create_future()
         job = _Job(batch_num, batch, func, ctx, fut)
         await self._queue.put(job)

@@ -9,6 +9,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent))
 
 from glossary import load_glossary, auto_extract_glossary
+from llm_translator import delete_checkpoint_files
 from proofreader import (run_proofread, run_quick_proofread,
                          _load_session, _load_quick_session,
                          _proofread_checkpoint_dir, _quick_checkpoint_dir)
@@ -125,8 +126,8 @@ def step2(exclude_path):
     if c == len(fnames):
         return Path("__AUTO__"), None
     gp = xlsx_files[c - 1]
-    xls = pd.ExcelFile(gp)
-    sheets = xls.sheet_names
+    with pd.ExcelFile(gp) as xls:
+        sheets = xls.sheet_names
     if len(sheets) == 1:
         print(f"  自動使用工作表: {sheets[0]}")
         return gp, sheets
@@ -134,8 +135,8 @@ def step2(exclude_path):
     return gp, selected
 
 def step3(excel_path):
-    xls = pd.ExcelFile(excel_path)
-    sheets = xls.sheet_names
+    with pd.ExcelFile(excel_path) as xls:
+        sheets = xls.sheet_names
     if len(sheets) == 1:
         print(f"  自動使用工作表: {sheets[0]}")
         return sheets
@@ -294,7 +295,8 @@ def main():
         if old_cp.exists():
             import shutil
             shutil.rmtree(old_cp)
-        print("  已清除舊進度。")
+        delete_checkpoint_files(str(_get_workplace()))
+        print("  已清除舊進度（含共享 _checkpoint）。")
         exist_session = None
     if exist_session:
         if not prompt_resume(exist_session):
@@ -304,7 +306,8 @@ def main():
                 cp = _proofread_checkpoint_dir(str(_get_workplace()))
             if cp.exists():
                 import shutil; shutil.rmtree(cp)
-                print("\n  已清除舊進度。")
+            delete_checkpoint_files(str(_get_workplace()))
+            print("\n  已清除舊進度（含共享 _checkpoint）。")
         else:
             excel_path = Path(exist_session["excel_path"])
             glossary_path_str = exist_session.get("glossary_path")
@@ -363,6 +366,15 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except RuntimeError as e:
+        if "all APIs permanently disabled" in str(e):
+            print("\n  ⚠️ 所有 API 已永久停用（兩次 429 限流），無法繼續。")
+            print("  已儲存部分校對進度，請檢查 API Key 後重新執行即可續傳。")
+            input("\n按 Enter 鍵...")
+        else:
+            print(f"\n錯誤: {e}")
+            import traceback; traceback.print_exc()
+            input("\n按 Enter 鍵...")
     except Exception as e:
         print(f"\n錯誤: {e}")
         import traceback; traceback.print_exc()

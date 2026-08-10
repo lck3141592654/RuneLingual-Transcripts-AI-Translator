@@ -6,9 +6,10 @@
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # 類別級預設並發（硬編碼）
 MAIN_DEFAULT_LIMIT = 10

@@ -210,6 +210,8 @@ async def _evaluate_batch(client, model, batch, glossary, api_id):
                     if isinstance(r, dict) and r.get("index") in batch_indices:
                         mapped[r["index"]] = r
                 results = list(mapped.values())
+                if not results:
+                    raise ValueError("回傳為空或無匹配的 index，視為失敗重試")
 
             if isinstance(results, list) and len(results) > 0:
                 # 低评估率检查（< 75% 視為失敗重試，在所有路徑後執行）
@@ -324,7 +326,85 @@ def _load_phase2_category(output_dir, sheet_name, df):
     return result
 
 
-async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=None):
+def _save_phase2_progress(output_dir, sheet_name, data) -> None:
+    """原子寫入 P2 進度（記錄 tag 與各輪已完成批次）。"""
+    cd = _proofread_checkpoint_dir(output_dir, sheet_name)
+    cd.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(cd / "phase2_progress.json", json.dumps(data, ensure_ascii=False))
+
+
+def _load_phase2_progress(output_dir, sheet_name) -> dict | None:
+    fp = _proofread_checkpoint_dir(output_dir, sheet_name) / "phase2_progress.json"
+    if fp.exists():
+        try:
+            return json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
+def _delete_phase2_progress(output_dir, sheet_name) -> None:
+    fp = _proofread_checkpoint_dir(output_dir, sheet_name) / "phase2_progress.json"
+    if fp.exists():
+        try:
+            fp.unlink()
+        except OSError:
+            pass
+
+
+def _update_phase2_progress(output_dir, sheet_name, tag, total_batches, batch_num, rnd) -> None:
+    """每完成一批就更新進度檔（同步執行，無 await，避免並行寫入競爭）。"""
+    key = "round1_done" if rnd == 1 else "round2_done"
+    data = _load_phase2_progress(output_dir, sheet_name) or {
+        "tag": tag, "total_batches": total_batches, "round1_done": [], "round2_done": [],
+    }
+    data["tag"] = tag
+    data["total_batches"] = total_batches
+    done = data.setdefault(key, [])
+    if batch_num not in done:
+        done.append(batch_num)
+    _save_phase2_progress(output_dir, sheet_name, data)
+
+
+def _load_phase2_parts(output_dir, sheet_name, tag, rnd) -> dict:
+    """合併同 tag 的 P2 批次 part 檔（r1/r2 分開）。"""
+    cd = _proofread_checkpoint_dir(output_dir, sheet_name)
+    merged = {}
+    if not cd.exists():
+        return merged
+    for f in sorted(cd.glob(f"{tag}_*_r{rnd}.json")):
+        try:
+            merged.update(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    return merged
+
+
+def _plan_phase2_tasks(batches, resume_progress, output_dir, sheet_name):
+    """回傳 (tag, rr1, rr2, tasks)。續傳時只重送未完成的批次。"""
+    if resume_progress:
+        tag = resume_progress.get("tag") or uuid.uuid4().hex[:8]
+        rr1 = _load_phase2_parts(output_dir, sheet_name, tag, 1)
+        rr2 = _load_phase2_parts(output_dir, sheet_name, tag, 2)
+        done1 = set(resume_progress.get("round1_done", []))
+        done2 = set(resume_progress.get("round2_done", []))
+        tasks = [
+            (bn, rnd, batches[bn - 1])
+            for bn in range(1, len(batches) + 1)
+            for rnd, done in ((1, done1), (2, done2))
+            if bn not in done
+        ]
+        return tag, rr1, rr2, tasks
+    tag = uuid.uuid4().hex[:8]
+    tasks = [
+        (bn, rnd, batch)
+        for bn, batch in enumerate(batches, 1)
+        for rnd in (1, 2)
+    ]
+    return tag, {}, {}, tasks
+
+
+async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=None, resume_progress=None):
     pending = []
     for idx, row in df.iterrows():
         trans = row.get("translation")
@@ -348,16 +428,8 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
     if pool is None:
         print("  錯誤：沒有可用的共享 API 池")
         return df, []
-    rr1 = {}
-    rr2 = {}
-    tag = uuid.uuid4().hex[:8]
     total_batches = len(batches)
-
-    # Mix all R1 and R2 batches together in one pool
-    all_tasks = []
-    for bn, batch in enumerate(batches, 1):
-        all_tasks.append((bn, 1, batch))  # (orig_bn, round, data)
-        all_tasks.append((bn, 2, batch))
+    tag, rr1, rr2, all_tasks = _plan_phase2_tasks(batches, resume_progress, output_dir, sheet_name)
 
     async def process_batch(ws, job):
         orig_bn, rnd, batch = job.ctx
@@ -381,6 +453,7 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
                 cd2 = _proofread_checkpoint_dir(output_dir, sheet_name)
                 cd2.mkdir(parents=True, exist_ok=True)
                 atomic_write_text(cd2 / f"{tag}_{orig_bn:06d}_r{rnd}.json", json.dumps(part_data, ensure_ascii=False))
+                _update_phase2_progress(output_dir, sheet_name, tag, total_batches, orig_bn, rnd)
             _timestamp(f"P2-R{rnd} 批次 {orig_bn}/{total_batches} 完成 ({success_count} 條) [{cfg.api_id} {cfg.model}]")
         except Exception as e:
             es = str(e).lower()
@@ -406,13 +479,13 @@ async def phase2_llm_evaluate(df, glossary, output_dir, sheet_name=None, pool=No
     except RuntimeError as e:
         if "all APIs permanently disabled" in str(e):
             print("  ⚠️ 所有 API 已永久停用，Phase 2 評估中斷")
-            _save_phase2_results(output_dir, sheet_name, rr1, rr2)
-            print(f"  P2 完成（部分）：已儲存 {len(rr1)} 條結果")
+            print(f"  P2 部分進度已保留（R1 {len(rr1)} 條），續傳時會從未完成批次繼續")
             return df, []
         raise
     round1_results = deepcopy(rr1)
     round2_results = deepcopy(rr2)
     _save_phase2_results(output_dir, sheet_name, round1_results, round2_results)
+    _delete_phase2_progress(output_dir, sheet_name)
     second_category = []
     for idx_str, r1r in round1_results.items():
         idx = int(idx_str)
@@ -521,6 +594,8 @@ async def _polish_batch(client, model, batch, glossary, api_id):
                     if isinstance(r, dict) and r.get("index") in batch_indices:
                         mapped[r["index"]] = r
                 results = list(mapped.values())
+                if not results:
+                    raise ValueError("回傳為空或無匹配的 index，視為失敗重試")
 
             if isinstance(results, list) and len(results) > 0:
                 success = sum(1 for r in results if isinstance(r, dict) and r.get("translation"))
@@ -589,11 +664,23 @@ async def _polish_batch(client, model, batch, glossary, api_id):
                 await asyncio.sleep(3)
     return [{"index": item.get("_idx", 0), "translation": None, "_error": "Polish failed"} for item in batch]
 
-def _save_polish_checkpoint(output_dir, sheet_name, backup_data):
+def _save_polish_checkpoint(output_dir, sheet_name, backup_data, rnd, failed_indices=None):
     cd = _proofread_checkpoint_dir(output_dir, sheet_name)
     cd.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(cd / "polish_results.json", json.dumps(backup_data, ensure_ascii=False))
-    _mark_phase_complete(output_dir, sheet_name, "polish")
+    fp = cd / "polish_results.json"
+    # 累積合併各輪結果，續傳時才能還原先前所有輪次的潤色成果
+    old_data = {}
+    if fp.exists():
+        try:
+            old = json.loads(fp.read_text(encoding="utf-8"))
+            if isinstance(old, dict) and isinstance(old.get("data"), dict):
+                old_data = old["data"]
+        except Exception:
+            pass
+    merged = {**old_data, **backup_data}
+    data = {"rounds_completed": rnd + 1, "data": merged}
+    data["failed_indices"] = list(failed_indices or [])
+    atomic_write_text(fp, json.dumps(data, ensure_ascii=False))
 
 
 def _apply_polish_from_checkpoint(df, output_dir, sheet_name):
@@ -601,17 +688,69 @@ def _apply_polish_from_checkpoint(df, output_dir, sheet_name):
     if fp.exists():
         try:
             data = json.loads(fp.read_text(encoding="utf-8"))
-            for idx_str, trans in data.items():
+            if isinstance(data, dict) and "rounds_completed" in data:
+                backup = data.get("data", {})
+            else:
+                backup = data
+            for idx_str, trans in backup.items():
                 idx = int(idx_str)
                 if idx in df.index:
                     df.at[idx, "translation"] = trans
-            print(f"    從 checkpoint 還原 {len(data)} 條潤色結果")
+            print(f"    從 checkpoint 還原 {len(backup)} 條潤色結果")
         except Exception:
             pass
     return df
 
 
-async def polish_translations(df, second_category, glossary, output_dir, sheet_name=None, pool=None):
+def _get_polish_round(output_dir, sheet_name) -> int:
+    """回傳已完成的 P3 潤色輪次（0 = 尚未開始）。"""
+    fp = _proofread_checkpoint_dir(output_dir, sheet_name) / "polish_results.json"
+    if fp.exists():
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("rounds_completed"), int):
+                return data["rounds_completed"]
+        except Exception:
+            pass
+    return 0
+
+
+def _is_empty_translation(trans) -> bool:
+    """譯文是否為空／缺失（P3 只對這類條目重試）。"""
+    return trans is None or (isinstance(trans, float) and pd.isna(trans)) or str(trans).strip() == ""
+
+
+def _has_polish_checkpoint(output_dir, sheet_name) -> bool:
+    return _proofread_checkpoint_dir(output_dir, sheet_name).joinpath("polish_results.json").exists()
+
+
+def _get_polish_failed_indices(output_dir, sheet_name) -> list:
+    """回傳上一輪失敗（沒有新譯文結果）的條目索引。"""
+    fp = _proofread_checkpoint_dir(output_dir, sheet_name) / "polish_results.json"
+    if fp.exists():
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                failed = data.get("failed_indices", [])
+                return sorted(int(i) for i in failed)
+        except Exception:
+            pass
+    return []
+
+
+def _resume_polish_indices(all_indices, df, failed_indices) -> list:
+    """續傳 P3 時要處理的條目：譯文仍為空，或上一輪失敗但保留舊譯文。"""
+    failed = set(failed_indices or [])
+    result = []
+    for idx in all_indices:
+        if idx not in df.index:
+            continue
+        if idx in failed or _is_empty_translation(df.at[idx, "translation"]):
+            result.append(idx)
+    return sorted(result)
+
+
+async def polish_translations(df, second_category, glossary, output_dir, sheet_name=None, pool=None, start_round: int = 0, failed_indices=None):
     all_indices = set()
     for item in second_category:
         all_indices.add(item["index"])
@@ -624,8 +763,11 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
 
     MAX_ROUNDS = 3
     current_indices = sorted(all_indices)
+    # 續傳：只保留「譯文仍為空」或「上一輪失敗」的條目，已潤色完成的不重送
+    if start_round > 0:
+        current_indices = _resume_polish_indices(all_indices, df, failed_indices)
 
-    for rnd in range(MAX_ROUNDS):
+    for rnd in range(start_round, MAX_ROUNDS):
         pending = []
         for idx in current_indices:
             if idx not in df.index:
@@ -699,17 +841,17 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
             if "all APIs permanently disabled" in str(e):
                 print("  ⚠️ 所有 API 已永久停用，Phase 3 润色中断")
                 if all_backup:
-                    _save_polish_checkpoint(output_dir, sheet_name, all_backup)
+                    partial_failed = sorted(idx for idx in current_indices if str(idx) not in all_backup)
+                    _save_polish_checkpoint(output_dir, sheet_name, all_backup, rnd - 1, failed_indices=partial_failed)
                     sync_progress(output_dir, sheet_name)
                 print(f"  P3 完成（部分）：已储存 {len(all_backup)} 条结果")
                 return df
             raise
 
-        if all_backup:
-            _save_polish_checkpoint(output_dir, sheet_name, all_backup)
+        failed = sorted(idx for idx in current_indices if str(idx) not in all_backup)
+        if all_backup or failed:
+            _save_polish_checkpoint(output_dir, sheet_name, all_backup, rnd, failed_indices=failed)
             sync_progress(output_dir, sheet_name)
-        else:
-            print(f"  P3 警告：所有批次均失败，未储存 checkpoint")
 
         _timestamp(f"P3 第 {rnd + 1} 轮：{len(all_backup)} 条已润色")
 
@@ -719,10 +861,9 @@ async def polish_translations(df, second_category, glossary, output_dir, sheet_n
             for idx in current_indices:
                 if idx not in df.index:
                     continue
-                row = df.loc[idx]
-                trans = row.get("translation")
-                # Only retry if translation is missing/failed (quality checks are handled by Phase 4)
-                if trans is None or (isinstance(trans, float) and pd.isna(trans)) or str(trans).strip() == "":
+                trans = df.at[idx, "translation"]
+                # 重送「譯文仍為空」或「本輪失敗但保留舊譯文」的條目
+                if _is_empty_translation(trans) or idx in failed:
                     remaining.add(idx)
 
             current_indices = sorted(remaining)
@@ -957,7 +1098,10 @@ async def _proofread_phase2(sheet_name, st, glossary, workplace_str, pool):
         sc = _load_phase2_category(workplace_str, sheet_name, df)
         print(f"    P2 還原：{len(sc)} 條第二類問題")
     else:
-        df, sc = await phase2_llm_evaluate(df, glossary, workplace_str, sheet_name=sheet_name, pool=pool)
+        progress = _load_phase2_progress(workplace_str, sheet_name)
+        if progress:
+            print("    P2 續傳：從未完成批次繼續")
+        df, sc = await phase2_llm_evaluate(df, glossary, workplace_str, sheet_name=sheet_name, pool=pool, resume_progress=progress)
     st["df"] = df
     st["sc"] = sc
 
@@ -966,10 +1110,13 @@ async def _proofread_phase3(sheet_name, st, glossary, workplace_str, pool):
     df = st["df"]
     sc = st["sc"]
     _timestamp(f"P3 開始：{sheet_name}...")
-    if _is_phase_complete(workplace_str, sheet_name, "polish"):
+    start_round = _get_polish_round(workplace_str, sheet_name)
+    failed = _get_polish_failed_indices(workplace_str, sheet_name)
+    if _has_polish_checkpoint(workplace_str, sheet_name):
         df = _apply_polish_from_checkpoint(df, workplace_str, sheet_name)
-    else:
-        df = await polish_translations(df, sc, glossary, workplace_str, sheet_name=sheet_name, pool=pool)
+        if start_round > 0:
+            print(f"    P3 續傳：從第 {start_round + 1} 輪繼續")
+    df = await polish_translations(df, sc, glossary, workplace_str, sheet_name=sheet_name, pool=pool, start_round=start_round, failed_indices=failed)
     st["df"] = df
 
 

@@ -4,7 +4,7 @@ import json, asyncio, time, re
 from dotenv import load_dotenv
 from datetime import datetime
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from glossary import ADD_LIST, normalize_term, find_term_spans, build_relevance_context
 from llm_translator import BATCH_SIZE_LIMIT, atomic_write_text, get_relevant_glossary, is_missing_translation
@@ -232,6 +232,52 @@ def _filter_llm_pool(pool):
     return [item for item in pool if any(itype != "space" for itype, _, _ in item[2])]
 
 
+def _extract_retry_results(parsed, batch):
+    """把重譯階段的模型回傳正規化成「屬於本批次的 dict 清單」。
+
+    支援 dict 包裝（translations/translated/data/results）、巢狀結構與單一物件；
+    超過 120% 回傳視為失敗（回傳 None）；空結果回傳 []（由呼叫端視為失敗）。
+    """
+    if isinstance(parsed, dict):
+        found = None
+        for key in ("translations", "translated", "data", "results"):
+            cand = parsed.get(key)
+            if isinstance(cand, list) and (not cand or isinstance(cand[0], dict)):
+                found = cand
+                break
+        if found is None:
+            for value in parsed.values():
+                if isinstance(value, list) and value and isinstance(value[0], dict) \
+                        and "index" in value[0] and "translation" in value[0]:
+                    found = value
+                    break
+            if found is None:
+                for value in parsed.values():
+                    if isinstance(value, dict):
+                        for v2 in value.values():
+                            if isinstance(v2, list) and v2 and isinstance(v2[0], dict) \
+                                    and "index" in v2[0] and "translation" in v2[0]:
+                                found = v2
+                                break
+        if found is None:
+            if "index" in parsed and "translation" in parsed:
+                parsed = [parsed]
+            else:
+                return None
+        else:
+            parsed = found
+    if not isinstance(parsed, list):
+        return None
+    if len(parsed) > int(len(batch) * OVER_RETURN_TOLERANCE):
+        return None
+    batch_indices = {item[0] for item in batch}
+    mapped = {}
+    for r in parsed:
+        if isinstance(r, dict) and r.get("index") in batch_indices:
+            mapped[r["index"]] = r
+    return list(mapped.values())
+
+
 async def _retry_round(client, model_name, pool, glossary, rnd):
     """非同步執行一輪重譯，返回修正後的條目數"""
     # 每批 BATCH_SIZE_LIMIT（100）條，無群組機制
@@ -256,9 +302,10 @@ async def _retry_round(client, model_name, pool, glossary, rnd):
                 content = re.sub(r"^```(?:json)?\n?", "", content, flags=re.IGNORECASE)
                 content = re.sub(r"\n```$", "", content)
                 parsed = json.loads(content)
-                if len(parsed) > int(len(batch) * OVER_RETURN_TOLERANCE):
-                    raise ValueError(f"回傳 {len(parsed)} 條，超過批次 {len(batch)} 的 {int(OVER_RETURN_TOLERANCE * 100)}%，視為失敗重試")
-                all_results.extend(parsed)
+                results = _extract_retry_results(parsed, batch)
+                if not results:
+                    raise ValueError("回傳為空、結構無法識別或無匹配的 index，視為失敗重試")
+                all_results.extend(results)
                 # 保持正則操作，不要改為字串，否則會大幅降低翻譯成功率
                 break
             except json.JSONDecodeError as e:
@@ -268,8 +315,9 @@ async def _retry_round(client, model_name, pool, glossary, rnd):
                     repaired = repair_json(content)
                     if repaired:
                         fixed = json.loads(repaired)
-                        if isinstance(fixed, list):
-                            all_results.extend(fixed)
+                        results = _extract_retry_results(fixed, batch)
+                        if results:
+                            all_results.extend(results)
                             print(f"    ⚠️ JSON 修復成功")
                             break
                 except Exception:

@@ -212,11 +212,6 @@ def _find_multi_word_span(parts: list, text_l: str) -> list[tuple[int, int]]:
         start = pos + 1
 
 
-def _is_plural_like(word: str) -> bool:
-    """粗略判斷一個詞是否為複數形態（以 s/es/ies/ves 結尾）。"""
-    return word.endswith(("s", "es", "ies", "ves"))
-
-
 def load_glossary(
     glossary_path: str | Path | None,
     sheet_names: list[str] | None = None,
