@@ -12,16 +12,11 @@ An AI-powered automated pipeline designed for large-scale game text translation.
 
 > ⚠️ **Beta Notice**: This tool is currently in beta and only supports **Simplified Chinese** translation. Other languages will be supported in the official release.
 
-## Latest Update on 10/8/2026, see [Changelog](Changelog.md) for details
-- **Dict responses in retry path**: wrapped keys, nested structures and single objects are now parsed consistently with the other LLM paths
-- **Empty responses treated as failures**: all four LLM paths (translate/retry/eval/polish) retry 3 times when the response is empty or no index matches, instead of silently completing with 0 items
-- **"First N" negative guard**: the test-range input rejects negative numbers, with an apply-side guard
-- **.env loading fix**: now loaded from the script directory, so API settings work regardless of the working directory
-- **Windows file-lock fix**: Excel files opened in the interactive menus are always closed via `with`
-- **Consistent untranslated counts**: stats and actual checks both use `is_missing_translation()`
-- **Prompt sanitization**: NaN values are no longer sent to the model as invalid JSON
-- **Proofreading resume hardening**: declining resume / mode switch clears the shared checkpoint; P2 evaluation resumes at batch level; P3 re-sends failed entries and merges results across rounds
-- **No more hang when all APIs are disabled**: `submit()` raises immediately and the CLIs show a friendly message before exiting
+## Latest Update on 12/8/2026, see [Changelog](Changelog.md) for details
+- **Multi-word term fix**: positional matching for terms with 3+ words (e.g. White Wolf Mountain) no longer misses matches, so long terms enter relevance filtering and enforcement correctly
+- **`{}` placeholder support**: template matching now supports the `{}` shorthand, treated as `{0}` when filling
+- **Concurrency setting guard**: `PARALLEL_LIMIT` set to 0 or negative no longer hangs forever; it warns and falls back to the category default
+- **Code cleanup**: removed unused imports, added type annotations, and tidied up parts of the flow
 
 ### Features
 
@@ -148,7 +143,7 @@ BASE_URL=https://openrouter.ai/api/v1
 ## Usage
 
 ### Running the Main translation script
-Place the translation target Excel and glossary (optional) into the `workplace/` directory, then run the main controller script.
+Place the translation target Excel and glossary (optional) into the `workplace/` directory, then run `batch_translate.py`.
 
 ### Interactive Steps (Translation)
 
@@ -281,7 +276,7 @@ IGNORE_LIST: set[str] = {
 
 ⚠️ **This feature is not yet enabled** (the `TEMPLATES` list is empty). All entries are currently handled entirely by AI translation.
 
-Template matching will be added in the **official release**. Users will then be able to define regex templates for automatic translation fill-in (e.g., `"Talk to (.+?)\\."` → `"与{0}对话。"`), reducing the number of API calls. Interested users can refer to the comments in `tm_matcher.py` to learn the syntax in advance.
+Template matching will be added in the **official release**. Users will then be able to define regex templates for automatic translation fill-in (e.g., `"Talk to (.+?)\."` → `"与{0}对话。"`), reducing the number of API calls. Interested users can refer to the comments in `tm_matcher.py` to learn the syntax in advance.
 
 ---
 
@@ -337,7 +332,7 @@ Using paid API DeepSeek V4 Flash as the baseline (1x), the following shows the r
 **Q: After running, `ImportError: No module named 'openai'` appears**
 <br>A: Dependencies not installed. Run `pip install openai pandas openpyxl python-dotenv json-repair`.
 
-**Q: `no available API` appears (or "0 available APIs loaded")**
+**Q: `no available API` appears**
 <br>A: The `.env` file is missing or its settings are invalid (missing API_KEY / MODEL / BASE_URL). Copy `.env.example` to `.env` and fill in your API Key; the script also prints warnings listing which fields are missing per API.
 
 **Q: API requests keep failing or timing out**

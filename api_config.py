@@ -114,6 +114,9 @@ def load_api_configs() -> list[ApiConfig]:
         if limit_str:
             try:
                 parallel_limit = int(limit_str)
+                if parallel_limit < 1:
+                    print(f"  警告：API{idx} 的 PARALLEL_LIMIT={limit_str} 必須 ≥ 1，使用類別預設")
+                    parallel_limit = MAIN_DEFAULT_LIMIT if api_type == "main" else FALLBACK_DEFAULT_LIMIT
             except ValueError:
                 print(f"  警告：API{idx} 的 PARALLEL_LIMIT '{limit_str}' 無效，使用類別預設")
                 parallel_limit = MAIN_DEFAULT_LIMIT if api_type == "main" else FALLBACK_DEFAULT_LIMIT

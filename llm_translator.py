@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime
 import pandas as pd
 from dotenv import load_dotenv
-from glossary import normalize_term, find_term_spans, build_relevance_context
+from glossary import find_term_spans, build_relevance_context
 from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
 
 load_dotenv(Path(__file__).resolve().parent / ".env")

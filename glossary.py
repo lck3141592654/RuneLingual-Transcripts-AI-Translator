@@ -152,8 +152,8 @@ def find_term_spans(term: str, text: str, ctx: tuple[set, dict] | None = None) -
         ctx = build_relevance_context(text_l)
     words, plural_map = ctx
     is_multi = " " in term_l
+    parts = term_l.split() if is_multi else []
     if is_multi:
-        parts = term_l.split()
         # 詞集合預篩：任一詞（或其變形）不在文本中就直接跳過
         for w in parts:
             if w in words:
@@ -196,7 +196,8 @@ def _find_multi_word_span(parts: list, text_l: str) -> list[tuple[int, int]]:
                 break
             cursor = nxt + len(w)
         if not ok:
-            return []
+            start = pos + 1
+            continue
         # 最後一詞：原樣或帶複數後綴，且與前一詞之間只能有空白
         last = parts[-1]
         found = False

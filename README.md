@@ -12,16 +12,11 @@
 
 > ⚠️ **測試版公告**：本工具目前為測試階段，暫時只支援**簡體中文**翻譯。其他語言將在正式版中支援。
 
-## 最近更新 (10/8/2026)，更新詳情請看 [Changelog](Changelog.md)
-- **重譯路徑支援 dict 回傳**：包裝 key、巢狀結構與單一物件皆可正確解析，與其他 LLM 路徑一致
-- **空回傳視為失敗**：四條 LLM 路徑（翻譯/重譯/評估/潤色）回傳為空或 index 全數不匹配時自動 3 輪重試，不再靜默完成 0 條
-- **「前 N 條」負數防呆**：僅測試前 N 條拒絕負數輸入，套用端另有保護
-- **.env 載入修正**：改以腳本所在目錄讀取，任何工作目錄執行都能載入 API 設定
-- **Windows 檔鎖修正**：互動選單開啟的 Excel 一律自動關閉
-- **未翻譯計數口徑一致**：統計與實際判定統一使用 `is_missing_translation()`
-- **提示詞淨化**：NaN 空值不再以無效 JSON 送給模型
-- **校對續傳強化**：拒絕續傳/模式切換清空共用 checkpoint；P2 評估批次級續傳；P3 失敗條目自動重送、各輪結果累積合併
-- **全 API 停用不再卡死**：submit 立即拋錯，CLI 顯示友善提示後正常結束
+## 最近更新 (12/8/2026)，更新詳情請看 [Changelog](Changelog.md)
+- **多字詞術語修正**：3 字以上詞組（如 White Wolf Mountain）位置比對不再漏配對，長術語可正確進入相關性篩選與強制檢查
+- **模板 `{}` 佔位符**：模板比對現在支援 `{}` 寫法，填入時自動視為 `{0}`
+- **並發設定防呆**：`PARALLEL_LIMIT` 設為 0 或負數時不再無限等待，改為提示並使用類別預設
+- **代碼整理**：移除未使用的 import、補齊型別註解、整理部分流程
 
 ### 特色
 
@@ -331,7 +326,7 @@ IGNORE_LIST: set[str] = {
 **Q：執行後出現 `ImportError: No module named 'openai'`**
 <br>A：尚未安裝依賴，執行 `pip install openai pandas openpyxl python-dotenv json-repair`。
 
-**Q：啟動後出現 `no available API` 或「已載入 0 個可用 API」**
+**Q：啟動後出現 `no available API`**
 <br>A：`.env` 尚未建立或設定無效（缺少 API_KEY / MODEL / BASE_URL）。複製 `.env.example` 為 `.env`，填入 API Key 後再執行；腳本也會印出各 API 缺少欄位的警告。
 
 **Q：API 請求一直失敗或超時**

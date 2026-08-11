@@ -6,7 +6,7 @@ from datetime import datetime
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from glossary import ADD_LIST, normalize_term, find_term_spans, build_relevance_context
+from glossary import ADD_LIST, find_term_spans, build_relevance_context
 from llm_translator import BATCH_SIZE_LIMIT, atomic_write_text, get_relevant_glossary, is_missing_translation
 from api_config import API_TIMEOUT, OVER_RETURN_TOLERANCE
 from shared_pool import SharedBatchPool

@@ -212,6 +212,10 @@ def step4_choose_sheet_mode(untranslated_count: int, total_rows: int) -> dict:
         else:
             print("  無效輸入")
 
+    # 防呆：理論上不可到達（所有有效輸入皆在迴圈內 return）
+    raise AssertionError("unreachable")
+
+
 def step4_apply_mode(df_full: pd.DataFrame, mode: dict) -> pd.DataFrame:
     """根據預選模式對特定工作表的 DataFrame 套用範圍。"""
     untranslated_mask = df_full["translation"].apply(is_missing_translation)

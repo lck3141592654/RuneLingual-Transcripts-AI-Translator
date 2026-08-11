@@ -266,3 +266,23 @@
   - P3 polish records `failed_indices`, so failed entries are re-sent in later rounds and on resume
   - P3 checkpoint now merges results across rounds, so earlier rounds are not lost on resume
 - `submit()` raises immediately when all APIs are permanently disabled; both CLIs show a friendly message and exit cleanly (no more hang)
+
+## 12/8/2026 v0.4.2 -> v0.4.3
+
+### 中文
+- 修正多字詞術語（3 字以上詞組）位置比對漏配對：首詞之後接不上時改為繼續尋找下一次出現，不再提前回傳找不到；修復 `get_relevant_glossary()` 漏掉長術語、導致術語強制檢查不生效的問題（glossary.py）
+- 修正模板比對的 `{}` 佔位符：填值前將 `{}` 正規化為 `{0}`，與文件宣稱的「相容 {0} 也相容 {}」一致（tm_matcher.py）
+- 修正 `PARALLEL_LIMIT` 設為 0 或負數時，並發池建立 0 個 worker、任務無限卡死的問題：解析時驗證必須 ≥ 1，無效值印警告並退回類別預設（api_config.py）
+- 移除未使用的 import（enforcer.py、llm_translator.py 的 `normalize_term`；proofreader.py 函式內的 `import re`）
+- glossary.py：`parts` 提前初始化，避免後續使用時變數未定義
+- batch_translate.py：`step4_choose_sheet_mode` 迴圈後加入不可達防呆，確保所有路徑都明確回傳
+- proofreader.py：`generate_reports` / `generate_quick_reports` 參數與相關區域變數補上 `list[pd.DataFrame]` 型別註解
+
+### English
+- Fixed multi-word term (3+ words) positional matching: the search now continues at the next occurrence when the first word is not followed by the rest of the term, instead of returning not found; fixes `get_relevant_glossary()` dropping long terms so the term enforcement never applied (glossary.py)
+- Fixed `{}` placeholder support in template matching: `{}` is normalized to `{0}` before substitution, matching the documented behavior (tm_matcher.py)
+- Fixed an infinite hang when `PARALLEL_LIMIT` is 0 or negative: the parser now validates >= 1 and falls back to the category default with a warning (api_config.py)
+- Removed unused imports (`normalize_term` in enforcer.py / llm_translator.py; function-local `import re` in proofreader.py)
+- glossary.py initializes `parts` early to avoid a potential undefined-variable reference
+- batch_translate.py adds an unreachable guard after the selection loop so every path returns explicitly
+- proofreader.py adds `list[pd.DataFrame]` type annotations to the report generators and related locals

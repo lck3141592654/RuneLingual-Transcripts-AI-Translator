@@ -908,7 +908,6 @@ def _save_debug_info(api_id, model, batch_size, returned, success, text):
 
 # === Phase 4: Retry Protect ===
 async def retry_protect(df, glossary, output_dir, sheet_name=None, pool=None):
-    import re
     import pandas as pd
     # Compute relevant glossary (same logic as enforcer.enforce())
     all_text = " ".join(str(row.get("english", "")).lower() for _, row in df.iterrows())
@@ -951,7 +950,7 @@ def backup_target_file(excel_path):
 
 
 
-def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_second_category, all_review_rows, output_dir, overall_start):
+def generate_reports(excel_path, all_translated_dfs, all_original_dfs, all_second_category, all_review_rows: list[pd.DataFrame], output_dir, overall_start):
     from openpyxl.styles import Color, PatternFill
     out_path = Path(output_dir) / f"{Path(excel_path).stem}_proofread_output.xlsx"
     if all_translated_dfs:
@@ -1147,7 +1146,7 @@ async def run_proofread(excel_path, glossary_path, glossary_sheets, sheet_names,
     all_translated_dfs = {}
     all_original_dfs = {}
     all_second_category = {}
-    all_review_rows = []
+    all_review_rows: list[pd.DataFrame] = []
     if session and session.get("accumulated_review_rows"):
         all_review_rows.append(pd.DataFrame(session["accumulated_review_rows"]))
         print(f"    還原 {len(session['accumulated_review_rows'])} 條審查記錄")
@@ -1393,7 +1392,7 @@ async def _quick_phase4a(sheet_name, st, glossary, workplace_str, pool):
     st["review_df"] = review_df
 
 
-def generate_quick_reports(excel_path, all_translated_dfs, all_review_rows, output_dir, overall_start):
+def generate_quick_reports(excel_path, all_translated_dfs, all_review_rows: list[pd.DataFrame], output_dir, overall_start):
     from openpyxl.styles import Color, PatternFill
     out_path = Path(output_dir) / f"{Path(excel_path).stem}_quick_proofread_output.xlsx"
     if all_translated_dfs:
@@ -1459,7 +1458,7 @@ async def run_quick_proofread(excel_path, glossary_path, glossary_sheets, sheet_
     print(f"  術語庫載入完成：{len(glossary)} 條")
 
     all_translated_dfs = {}
-    all_review_rows = []
+    all_review_rows: list[pd.DataFrame] = []
     if session and session.get("accumulated_review_rows"):
         all_review_rows.append(pd.DataFrame(session["accumulated_review_rows"]))
         print(f"    還原 {len(session['accumulated_review_rows'])} 條審查記錄")

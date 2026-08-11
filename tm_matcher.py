@@ -55,7 +55,7 @@ def match_and_fill(df: pd.DataFrame, glossary: dict) -> pd.DataFrame:
                         all_in_glossary = False
                         break
                 if all_in_glossary:
-                    translated = tmpl["template"]
+                    translated = tmpl["template"].replace("{}", "{0}")
                     for i, tp in enumerate(translated_params):
                         translated = translated.replace("{" + str(i) + "}", tp)
                     df.at[idx, "translation"] = translated
